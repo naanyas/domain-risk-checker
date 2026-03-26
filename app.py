@@ -348,6 +348,25 @@ def display_results(results: list):
             # v7.5: Client-side harvest combo
             if row.get('has_harvest_combo'):
                 parts.append("🕸️ Harvest combo")
+            # v8.0: Mail-only domain indicator
+            if row.get('is_mail_only_domain'):
+                mx_type = _safe_str(row.get('mail_only_mx_provider_type') or row.get('mx_provider_type'))
+                parts.insert(0, f"📧 Mail-only ({mx_type})" if mx_type else "📧 Mail-only")
+            # v8.1: No-resolve domain indicator
+            if row.get('is_no_resolve_domain'):
+                parts.insert(0, "🔇 No-resolve (no A, no MX)")
+            # v8.1.1: Cannot receive mail indicator
+            if row.get('cannot_receive_mail'):
+                parts.insert(1 if row.get('is_no_resolve_domain') else 0, "📭 Cannot receive mail")
+            # v8.1.1: No email auth indicator (only for no-resolve domains)
+            if row.get('is_no_resolve_domain'):
+                _has_spf = row.get('spf_exists', False)
+                _has_dkim = row.get('dkim_exists', False)
+                _has_dmarc = row.get('dmarc_exists', False)
+                if not _has_spf and not _has_dkim and not _has_dmarc:
+                    parts.append("🚫 No email auth")
+                elif row.get('registration_opaque'):
+                    parts.append("🔒 WHOIS opaque")
             return ' · '.join(parts) if parts else ''
         
         # Build from full df (has all fields), then attach to summary_df
