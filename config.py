@@ -251,6 +251,103 @@ DEFAULT_CONFIG = {
         # === SUSPICIOUS CONTACT EMAIL (v7.7.1) ===
         "contact_email_spam_infra": 25,     # Email on page from spam infrastructure domain (mailtrap, mailinator, etc.)
         "contact_email_template": 15,       # Template placeholder email on page (info@company.com, info@example.com)
+
+        # === MAIL-ONLY DOMAIN SCORING (v8.0) ===
+        # Weights for domains with no A record but valid MX (email-only domains).
+        # These are evaluated via calculate_no_resolve_score() using DNS-only signals.
+        # Positive = risk, negative = legitimacy bonus.
+        "mail_only_no_spf": 8,                  # Missing SPF on mail-only domain
+        "mail_only_no_dkim": 8,                 # Missing DKIM on mail-only domain
+        "mail_only_no_dmarc": 8,                # Missing DMARC on mail-only domain
+        "mail_only_spf_permissive": 10,         # +all or ?all — allows spoofing
+        "mail_only_spf_syntax_error": 5,        # SPF record has syntax issues
+        "mail_only_spf_has_provider": -5,       # SPF includes real provider (Google, M365, etc.)
+        "mail_only_dkim_present": -5,           # DKIM configured — legitimacy signal
+        "mail_only_dmarc_reject": -10,          # DMARC p=reject — strongest policy
+        "mail_only_dmarc_quarantine": -5,       # DMARC p=quarantine — moderate policy
+        "mail_only_dmarc_none": 3,              # DMARC p=none — tells receivers to do nothing
+        "mail_only_dmarc_syntax_error": 5,      # DMARC record has syntax issues
+        "mail_only_has_bimi": -15,              # BIMI present — advanced email auth
+        "mail_only_has_mta_sts": -10,           # MTA-STS present — transport security
+        "mail_only_mx_enterprise": -10,         # Google Workspace / M365 / Proofpoint MX
+        "mail_only_mx_disposable": 20,          # Disposable MX provider (Titan, ImprovMX, etc.)
+        "mail_only_mx_selfhosted": 15,          # Self-hosted MX on same domain
+        "mail_only_mx_mail_prefix": 4,          # MX is mail.{domain} — phishing template
+        "mail_only_domain_created_today": 35,   # Domain registered today/yesterday
+        "mail_only_domain_lt_7d": 20,           # Domain 2-7 days old
+        "mail_only_domain_lt_30d": 10,          # Domain 8-30 days old
+        "mail_only_domain_lt_90d": 5,           # Domain 31-90 days old
+        "mail_only_domain_established": -8,     # Domain 1yr+ old — established
+        "mail_only_whois_privacy": 5,           # WHOIS privacy/proxy service
+        "mail_only_domain_reregistered": 10,    # Domain was dropped and re-bought
+        "mail_only_vt_malicious_high": 100,     # 5+ VT vendors flag as malicious
+        "mail_only_vt_malicious_medium": 40,    # 3-4 VT vendors flag as malicious
+        "mail_only_vt_malicious_low": 20,       # 1-2 VT vendors flag as malicious
+        "mail_only_vt_clean": -5,               # VT clean — no vendors flag as malicious
+        "mail_only_typosquat": 15,              # Typosquatting detected
+        "mail_only_homoglyph": 20,              # Homoglyph/IDN spoofing detected
+        "mail_only_suspicious_prefix": 10,      # Suspicious prefix (support-, help-, etc.)
+        "mail_only_suspicious_suffix": 10,      # Suspicious suffix (-verify, -secure, etc.)
+        "mail_only_brand_keyword": 15,          # Brand + spoofing keyword in domain
+        "mail_only_hyphenated_sld": 5,          # Hyphenated SLD (common in phishing)
+        "mail_only_domain_blacklisted": 45,     # Domain on DNSBL
+        "mail_only_suspicious_tld": 15,         # High-abuse TLD
+        "mail_only_free_email_domain": 15,      # Sending from gmail.com etc
+        "mail_only_disposable_email": 40,       # Disposable email domain
+        "mail_only_ns_parking": 15,             # NS delegated to parking service
+        "mail_only_ns_dynamic_dns": 25,         # NS delegated to dynamic DNS
+        "mail_only_ns_lame": 20,                # Zero NS records (broken/abandoned)
+        "mail_only_full_email_auth": -10,       # SPF + DKIM + DMARC reject/quarantine
+
+        # === NO-RESOLVE DOMAIN SCORING (v8.1) ===
+        # Weights for domains with no A record AND no valid MX (no web, no email).
+        # These are evaluated via calculate_no_resolve_score() using DNS-only signals.
+        # Base penalty of 25 for having neither web nor email presence, but not an
+        # automatic deny — remaining signals determine the final score.
+        "no_resolve_no_a_record": 25,              # Base penalty: no A record (no web presence)
+        "no_resolve_cannot_receive_mail": 10,      # No MX = cannot receive email (additional risk)
+        "no_resolve_no_email_auth": 15,            # No SPF + no DKIM + no DMARC (complete auth vacuum)
+        "no_resolve_no_spf": 5,                    # Missing SPF (partial auth gap)
+        "no_resolve_no_dkim": 5,                   # Missing DKIM (partial auth gap)
+        "no_resolve_no_dmarc": 5,                  # Missing DMARC (partial auth gap)
+        "no_resolve_spf_pass_all": 10,             # SPF +all = allows anyone to spoof
+        "no_resolve_dmarc_p_none": 5,              # DMARC p=none = no enforcement
+        "no_resolve_full_email_auth": -10,          # Full auth stack with enforcing DMARC (legitimacy bonus)
+        "no_resolve_registration_opaque": 10,      # RDAP + WHOIS both failed (hidden registration)
+        "no_resolve_domain_created_today": 35,     # Domain registered today/yesterday
+        "no_resolve_domain_lt_7d": 20,             # Domain 2-7 days old
+        "no_resolve_domain_lt_30d": 10,            # Domain 8-30 days old
+        "no_resolve_domain_lt_90d": 5,             # Domain 31-90 days old
+        "no_resolve_domain_established": -10,      # Domain 1yr+ old — established
+        "no_resolve_whois_privacy": 5,             # WHOIS privacy/proxy service
+        "no_resolve_domain_reregistered": 10,      # Domain was dropped and re-bought
+        "no_resolve_vt_malicious_high": 100,       # 5+ VT vendors flag as malicious
+        "no_resolve_vt_malicious_medium": 40,      # 3-4 VT vendors flag as malicious
+        "no_resolve_vt_malicious_low": 20,         # 1-2 VT vendors flag as malicious
+        "no_resolve_vt_clean": -5,                 # VT clean — no vendors flag as malicious
+        "no_resolve_typosquat": 15,                # Typosquatting detected
+        "no_resolve_homoglyph": 20,                # Homoglyph/IDN spoofing detected
+        "no_resolve_suspicious_prefix": 10,        # Suspicious prefix (support-, help-, etc.)
+        "no_resolve_suspicious_suffix": 10,        # Suspicious suffix (-verify, -secure, etc.)
+        "no_resolve_brand_keyword": 15,            # Brand + spoofing keyword in domain
+        "no_resolve_hyphenated_sld": 5,            # Hyphenated SLD (common in phishing)
+        "no_resolve_domain_blacklisted": 45,       # Domain on DNSBL
+        "no_resolve_suspicious_tld": 15,           # High-abuse TLD
+        "no_resolve_free_email_domain": 15,        # Sending from gmail.com etc
+        "no_resolve_disposable_email": 40,         # Disposable email domain
+        "no_resolve_ns_parking": 15,               # NS delegated to parking service
+        "no_resolve_ns_dynamic_dns": 25,           # NS delegated to dynamic DNS
+        "no_resolve_ns_lame": 20,                  # Zero NS records (broken/abandoned)
+        "no_resolve_ns_enterprise": -8,            # NS uses enterprise/premium DNS provider
+        "no_resolve_soa_fresh": -5,                # SOA serial updated in last 90 days — actively managed
+        "no_resolve_soa_stale": 10,                # SOA serial > 1 year old — possibly abandoned
+        "no_resolve_soa_missing": 5,               # No SOA record at all
+        "no_resolve_dnssec_enabled": -5,           # DNSSEC deployed — operational maturity signal
+        "no_resolve_ct_has_history": -8,           # CT logs show past certificate issuance
+        "no_resolve_ct_no_history": 5,             # Zero CT log entries — never had web presence
+        "no_resolve_free_tld": 10,                 # Free-registration TLD — zero investment
+        "no_resolve_high_entropy_sld": 10,         # SLD entropy > 3.8 — likely DGA-generated
+        "no_resolve_very_high_entropy_sld": 15,    # SLD entropy > 4.2 — almost certainly DGA
     },
     
     # ==========================================================================
@@ -629,7 +726,11 @@ DEFAULT_CONFIG = {
         '.shop', '.store', '.sale', '.deals', '.bargains', '.discount', '.cheap',
         '.buy', '.shopping', '.market', '.boutique', '.fashion', '.shoes',
     ],
-    
+
+    "free_registration_tlds": [
+        '.tk', '.ml', '.ga', '.cf', '.gq',
+    ],
+
     "protected_brands": [
         'paypal', 'amazon', 'microsoft', 'apple', 'google', 'facebook',
         'instagram', 'netflix', 'bankofamerica', 'chase', 'wellsfargo',
@@ -1170,6 +1271,25 @@ DEFAULT_CONFIG = {
             "zilore.com",            # Free tier DNS
             "rage4.com",             # Free tier
             "1984hosting.com",       # Icelandic free DNS
+        ],
+        "enterprise_ns": [
+            "cloudflare.com",        # Cloudflare DNS
+            "awsdns",                # AWS Route 53 (ns-XXX.awsdns-XX.{tld})
+            "route53",               # AWS Route 53 alternate
+            "azure-dns.com",         # Azure DNS
+            "azure-dns.net",         # Azure DNS
+            "azure-dns.org",         # Azure DNS
+            "azure-dns.info",        # Azure DNS
+            "googledomains.com",     # Google Domains
+            "google.com",            # Google Cloud DNS
+            "nsone.net",             # NS1
+            "ultradns.com",          # UltraDNS (Neustar/Vercara)
+            "ultradns.net",          # UltraDNS
+            "ultradns.org",          # UltraDNS
+            "akam.net",              # Akamai Edge DNS
+            "dynect.net",            # Dyn (Oracle)
+            "dnsmadeeasy.com",       # DNS Made Easy
+            "domaincontrol.com",     # GoDaddy (massive registrar, standard NS)
         ],
     },
     

@@ -18,7 +18,7 @@ Evaluates domain infrastructure signals for email sender approval decisions.
 # v6.x: WHOIS fallback, DNSBL fix, brand+keyword detection.
 # v4.x: TLD variant, hosting detection, app store, TLS, e-commerce.
 
-ANALYZER_VERSION = "7.5.1"
+ANALYZER_VERSION = "8.0.0"
 
 import re
 import json
@@ -443,7 +443,44 @@ class DomainApprovalResult:
     ct_cert_tls_dead: bool = False               # v7.5.1: Cert issued recently but TLS is dead/refusing
     ct_cert_tls_dead_detail: str = ""            # v7.5.1: Human-readable detail
     analyzed_root_note: str = ""                 # v7.5.1: Note when subdomain didn't resolve and root was analyzed instead
-    
+
+    # === MAIL-ONLY DOMAIN DETECTION ===
+    is_mail_only_domain: bool = False              # Domain has no A record but has valid MX records
+    mail_only_mx_records: str = ""                 # MX records found for mail-only domain
+    mail_only_mx_provider_type: str = ""           # MX provider classification for mail-only domain
+    mail_only_note: str = ""                       # Human-readable note about mail-only detection
+    mail_only_dns_score: int = -1                  # Composite DNS-based score for mail-only domains (-1 = not evaluated)
+    mail_only_dns_signals: str = ""                # Semicolon-separated DNS signals evaluated
+    mail_only_dns_breakdown: str = ""              # JSON breakdown of mail-only DNS scoring
+
+    # === NO-RESOLVE DOMAIN (v8.1) ===
+    is_no_resolve_domain: bool = False             # Domain has no A record AND no valid MX records
+    cannot_receive_mail: bool = False              # Domain has no valid MX — cannot receive email
+    no_resolve_note: str = ""                      # Human-readable note about no-resolve detection
+    no_resolve_dns_score: int = -1                 # Composite DNS-based score for no-resolve domains (-1 = not evaluated)
+    no_resolve_dns_signals: str = ""               # Semicolon-separated DNS signals evaluated
+    no_resolve_dns_breakdown: str = ""             # JSON breakdown of no-resolve DNS scoring
+
+    # === NS PROVIDER QUALITY (v8.1) ===
+    ns_is_enterprise: bool = False               # NS uses enterprise/premium DNS provider
+    ns_enterprise_match: str = ""                # Which enterprise NS pattern matched
+
+    # === SOA FRESHNESS (v8.1) ===
+    soa_exists: bool = False                     # SOA record found
+    soa_serial: int = 0                          # SOA serial number
+    soa_serial_is_date: bool = False             # Serial follows YYYYMMDDNN convention
+    soa_serial_date: str = ""                    # Parsed date from serial (ISO format)
+    soa_days_since_serial: int = -1              # Days since serial date (-1 = unknown)
+
+    # === DNSSEC (v8.1) ===
+    dnssec_enabled: bool = False                 # DNSKEY or DS record found
+
+    # === TLD REGISTRATION COST (v8.1) ===
+    is_free_registration_tld: bool = False       # TLD has free registration (.tk, .ml, .ga, .cf, .gq)
+
+    # === DOMAIN NAME ENTROPY (v8.1) ===
+    sld_entropy: float = 0.0                     # Shannon entropy of second-level domain label
+
     # === SUBDOMAIN DELEGATION ABUSE (v7.3.1) ===
     is_subdomain: bool = False                   # Submitted domain is a subdomain (not registrable root)
     is_staging_subdomain: bool = False           # Subdomain prefix indicates SDLC env (stg, staging, dev, test, uat, qa, sandbox)
@@ -1228,6 +1265,97 @@ def dns_query(domain: str, record_type: str) -> List[str]:
         return [str(rdata) for rdata in resolver.resolve(domain, record_type)]
     except Exception:
         return []
+
+
+def check_soa_freshness(domain: str) -> dict:
+    """
+    Query SOA record and assess freshness from serial number.
+    SOA serials often use YYYYMMDDNN format (10 digits, leading 20XX).
+    """
+    result = {
+        "soa_exists": False,
+        "soa_serial": 0,
+        "soa_serial_is_date": False,
+        "soa_serial_date": "",
+        "soa_days_since_serial": -1,
+    }
+    if not DNS_AVAILABLE:
+        return result
+    try:
+        resolver = dns.resolver.Resolver()
+        resolver.timeout = DNS_TIMEOUT
+        resolver.lifetime = DNS_TIMEOUT
+        answers = resolver.resolve(domain, 'SOA')
+        if not answers:
+            return result
+        soa = answers[0]
+        result["soa_exists"] = True
+        serial = soa.serial
+        result["soa_serial"] = serial
+        serial_str = str(serial)
+        if len(serial_str) == 10 and serial_str[:2] == '20':
+            try:
+                year = int(serial_str[0:4])
+                month = int(serial_str[4:6])
+                day = int(serial_str[6:8])
+                from datetime import date
+                serial_date = date(year, month, day)
+                result["soa_serial_is_date"] = True
+                result["soa_serial_date"] = serial_date.isoformat()
+                result["soa_days_since_serial"] = (date.today() - serial_date).days
+            except (ValueError, OverflowError):
+                pass
+    except Exception:
+        pass
+    return result
+
+
+def check_dnssec(domain: str) -> bool:
+    """Check if domain has DNSSEC enabled by querying for DNSKEY, fallback to DS."""
+    if not DNS_AVAILABLE:
+        return False
+    try:
+        resolver = dns.resolver.Resolver()
+        resolver.timeout = DNS_TIMEOUT
+        resolver.lifetime = DNS_TIMEOUT
+        answers = resolver.resolve(domain, 'DNSKEY')
+        if answers:
+            return True
+    except Exception:
+        pass
+    try:
+        resolver = dns.resolver.Resolver()
+        resolver.timeout = DNS_TIMEOUT
+        resolver.lifetime = DNS_TIMEOUT
+        answers = resolver.resolve(domain, 'DS')
+        if answers:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def calculate_domain_entropy(domain: str) -> float:
+    """
+    Calculate Shannon entropy of the second-level domain label.
+    Legitimate SLDs: ~2.0-3.2 bits/char (dictionary words, brand names)
+    DGA-generated:   ~3.5-5.0+ bits/char (random character sequences)
+    """
+    import math
+    parts = domain.lower().split('.')
+    sld = parts[-2] if len(parts) >= 2 else parts[0]
+    if not sld or len(sld) < 3:
+        return 0.0
+    freq = {}
+    for c in sld:
+        freq[c] = freq.get(c, 0) + 1
+    length = len(sld)
+    entropy = 0.0
+    for count in freq.values():
+        p = count / length
+        if p > 0:
+            entropy -= p * math.log2(p)
+    return round(entropy, 2)
 
 
 def get_ptr_record(ip: str) -> Tuple[bool, str, bool]:
@@ -2239,6 +2367,8 @@ def check_ns_risk(ns_records: List[str], ns_risk_config: dict) -> Dict:
         "dynamic_dns_match": "",
         "is_free_dns": False,
         "free_dns_match": "",
+        "is_enterprise_ns": False,
+        "enterprise_ns_match": "",
         "is_lame_delegation": False,
         "is_single_ns": False,
     }
@@ -2300,7 +2430,20 @@ def check_ns_risk(ns_records: List[str], ns_risk_config: dict) -> Dict:
                     break
             if result["is_free_dns"]:
                 break
-    
+
+    # Check enterprise NS patterns (skip if already flagged as risk)
+    if not result["is_parking"] and not result["is_dynamic_dns"] and not result["is_free_dns"]:
+        enterprise_patterns = ns_risk_config.get("enterprise_ns", [])
+        for pattern in enterprise_patterns:
+            pattern_lower = pattern.lower()
+            for ns in ns_lower:
+                if pattern_lower in ns:
+                    result["is_enterprise_ns"] = True
+                    result["enterprise_ns_match"] = pattern
+                    break
+            if result["is_enterprise_ns"]:
+                break
+
     return result
 
 
@@ -5831,6 +5974,204 @@ def generate_summary(res: DomainApprovalResult, signals: Set[str], rdap_enabled:
     return " | ".join(parts)
 
 
+def calculate_no_resolve_score(res, config: dict) -> dict:
+    """
+    Calculate a DNS-only composite score for domains with no web presence (v8.2).
+
+    Used for BOTH mail-only domains (no A, has MX) and no-resolve domains
+    (no A, no MX). Both lack a website, so they receive the same scrutiny.
+    The only difference is which missing-record flags fire:
+      - No A record: always fires (both paths)
+      - No MX / cannot receive mail: only fires for no-resolve domains
+
+    Runnable checks (all DNS-based, no HTTP needed):
+      - WHOIS/RDAP registration age
+      - VirusTotal domain lookup
+      - Typosquatting / homoglyph detection
+      - Domain name pattern checks (suspicious prefix/suffix)
+      - DNSBL checks
+      - Suspicious TLD checks
+      - NS risk detection (parking, dynamic DNS, lame delegation)
+      - NS provider quality (enterprise DNS bonus)
+      - SOA record freshness (active management signal)
+      - DNSSEC enabled (operational maturity signal)
+      - CT log presence (historical web presence signal)
+      - Free TLD registration cost (zero-investment signal)
+      - Domain name entropy (DGA detection)
+      - Email auth posture (SPF/DKIM/DMARC)
+      - Registration opacity
+    """
+    nr_score = 0
+    nr_signals = []
+    nr_breakdown = {}
+    weights = config.get('weights', DEFAULT_CONFIG['weights'])
+
+    def _add(signal, points):
+        nonlocal nr_score
+        nr_signals.append(signal)
+        if points != 0:
+            nr_breakdown[signal] = points
+            nr_score += points
+
+    # --- BASE PENALTY: No A record (no web presence) ---
+    _add("no_resolve_no_a_record", weights.get('no_resolve_no_a_record', 25))
+
+    # --- NO MX / CANNOT RECEIVE MAIL (v8.2) ---
+    # Only fires for no-resolve domains (no MX). Mail-only domains have MX
+    # so this doesn't apply to them.
+    if res.cannot_receive_mail:
+        _add("no_resolve_cannot_receive_mail", weights.get('no_resolve_cannot_receive_mail', 10))
+
+    # --- WHOIS / REGISTRATION AGE ---
+    if res.domain_age_days >= 0:
+        if res.domain_age_days <= 1:
+            _add("no_resolve_domain_created_today", weights.get('no_resolve_domain_created_today', 35))
+        elif res.domain_age_days <= 7:
+            _add("no_resolve_domain_lt_7d", weights.get('no_resolve_domain_lt_7d', 20))
+        elif res.domain_age_days <= 30:
+            _add("no_resolve_domain_lt_30d", weights.get('no_resolve_domain_lt_30d', 10))
+        elif res.domain_age_days <= 90:
+            _add("no_resolve_domain_lt_90d", weights.get('no_resolve_domain_lt_90d', 5))
+        elif res.domain_age_days >= 365:
+            _add("no_resolve_domain_established", weights.get('no_resolve_domain_established', -10))
+
+    if res.whois_privacy:
+        _add("no_resolve_whois_privacy", weights.get('no_resolve_whois_privacy', 5))
+
+    if res.domain_reregistered:
+        _add("no_resolve_domain_reregistered", weights.get('no_resolve_domain_reregistered', 10))
+
+    # --- EMAIL AUTH POSTURE (v8.1.1) ---
+    # For normal domains, missing email auth is a deliverability issue (score 0).
+    # For no-resolve domains, it's a risk signal: no website + no MX + no email
+    # auth = zero operational investment. Legitimate pre-launch domains typically
+    # set up SPF/DMARC before going live. Their absence here compounds the risk.
+    _no_spf = not res.spf_exists
+    _no_dkim = not res.dkim_exists
+    _no_dmarc = not res.dmarc_exists
+
+    if _no_spf and _no_dkim and _no_dmarc:
+        # Complete email auth vacuum — strongest signal
+        _add("no_resolve_no_email_auth", weights.get('no_resolve_no_email_auth', 15))
+    else:
+        if _no_spf:
+            _add("no_resolve_no_spf", weights.get('no_resolve_no_spf', 5))
+        if _no_dkim:
+            _add("no_resolve_no_dkim", weights.get('no_resolve_no_dkim', 5))
+        if _no_dmarc:
+            _add("no_resolve_no_dmarc", weights.get('no_resolve_no_dmarc', 5))
+
+    # SPF +all (pass everyone) on a no-resolve domain = likely spoofing setup
+    if res.spf_exists and res.spf_mechanism == "+all":
+        _add("no_resolve_spf_pass_all", weights.get('no_resolve_spf_pass_all', 10))
+
+    # DMARC p=none on a no-resolve domain = no enforcement intent
+    if res.dmarc_exists and res.dmarc_policy == "none":
+        _add("no_resolve_dmarc_p_none", weights.get('no_resolve_dmarc_p_none', 5))
+
+    # Bonus: Full email auth stack on a no-resolve domain = strong legitimacy signal
+    if res.spf_exists and res.dkim_exists and res.dmarc_exists:
+        if res.dmarc_policy in ("reject", "quarantine"):
+            _add("no_resolve_full_email_auth", weights.get('no_resolve_full_email_auth', -10))
+
+    # --- REGISTRATION OPAQUE (v8.1.1) ---
+    # Both RDAP and WHOIS failed to return any data. On a normal domain this
+    # could be GDPR (European ccTLDs). On a no-resolve domain with nothing
+    # else to go on, it's an additional opacity signal.
+    if res.registration_opaque:
+        _add("no_resolve_registration_opaque", weights.get('no_resolve_registration_opaque', 10))
+
+    # --- VIRUSTOTAL ---
+    if res.vt_available:
+        if res.vt_malicious_count >= 5:
+            _add("no_resolve_vt_malicious_high", weights.get('no_resolve_vt_malicious_high', 100))
+        elif res.vt_malicious_count >= 3:
+            _add("no_resolve_vt_malicious_medium", weights.get('no_resolve_vt_malicious_medium', 40))
+        elif res.vt_malicious_count >= 1:
+            _add("no_resolve_vt_malicious_low", weights.get('no_resolve_vt_malicious_low', 20))
+        elif res.vt_malicious_count == 0 and res.vt_total_vendors > 0:
+            _add("no_resolve_vt_clean", weights.get('no_resolve_vt_clean', -5))
+
+    # --- TYPOSQUATTING / HOMOGLYPH ---
+    if res.typosquat_target:
+        _add("no_resolve_typosquat", weights.get('no_resolve_typosquat', 15))
+    if res.is_homoglyph_domain:
+        _add("no_resolve_homoglyph", weights.get('no_resolve_homoglyph', 20))
+
+    # --- DOMAIN NAME PATTERNS ---
+    if res.has_suspicious_prefix:
+        _add("no_resolve_suspicious_prefix", weights.get('no_resolve_suspicious_prefix', 10))
+    if res.has_suspicious_suffix:
+        _add("no_resolve_suspicious_suffix", weights.get('no_resolve_suspicious_suffix', 10))
+    if res.brand_plus_keyword_domain:
+        _add("no_resolve_brand_keyword", weights.get('no_resolve_brand_keyword', 15))
+    if res.is_hyphenated_sld:
+        _add("no_resolve_hyphenated_sld", weights.get('no_resolve_hyphenated_sld', 5))
+
+    # --- DNSBL ---
+    if res.domain_blacklist_count > 0:
+        _add("no_resolve_domain_blacklisted", weights.get('no_resolve_domain_blacklisted', 45))
+
+    # --- SUSPICIOUS TLD ---
+    if res.is_suspicious_tld:
+        _add("no_resolve_suspicious_tld", weights.get('no_resolve_suspicious_tld', 15))
+    if res.is_free_email_domain:
+        _add("no_resolve_free_email_domain", weights.get('no_resolve_free_email_domain', 15))
+    if res.is_disposable_email:
+        _add("no_resolve_disposable_email", weights.get('no_resolve_disposable_email', 40))
+
+    # --- NS RISK ---
+    if res.ns_is_parking:
+        _add("no_resolve_ns_parking", weights.get('no_resolve_ns_parking', 15))
+    if res.ns_is_dynamic_dns:
+        _add("no_resolve_ns_dynamic_dns", weights.get('no_resolve_ns_dynamic_dns', 25))
+    if res.ns_is_lame_delegation:
+        _add("no_resolve_ns_lame", weights.get('no_resolve_ns_lame', 20))
+
+    # --- NS PROVIDER QUALITY (v8.1) ---
+    if res.ns_is_enterprise:
+        _add("no_resolve_ns_enterprise", weights.get('no_resolve_ns_enterprise', -8))
+
+    # --- SOA FRESHNESS (v8.1) ---
+    if not res.soa_exists:
+        _add("no_resolve_soa_missing", weights.get('no_resolve_soa_missing', 5))
+    elif res.soa_serial_is_date and res.soa_days_since_serial >= 0:
+        if res.soa_days_since_serial <= 90:
+            _add("no_resolve_soa_fresh", weights.get('no_resolve_soa_fresh', -5))
+        elif res.soa_days_since_serial > 365:
+            _add("no_resolve_soa_stale", weights.get('no_resolve_soa_stale', 10))
+
+    # --- DNSSEC (v8.1) ---
+    if res.dnssec_enabled:
+        _add("no_resolve_dnssec_enabled", weights.get('no_resolve_dnssec_enabled', -5))
+
+    # --- CT LOG PRESENCE (v8.1) ---
+    if res.ct_log_count >= 0:
+        if res.ct_log_count > 0:
+            _add("no_resolve_ct_has_history", weights.get('no_resolve_ct_has_history', -8))
+        elif res.ct_log_count == 0:
+            _add("no_resolve_ct_no_history", weights.get('no_resolve_ct_no_history', 5))
+
+    # --- FREE TLD (v8.1) ---
+    if res.is_free_registration_tld:
+        _add("no_resolve_free_tld", weights.get('no_resolve_free_tld', 10))
+
+    # --- DOMAIN NAME ENTROPY (v8.1) ---
+    if res.sld_entropy > 4.2:
+        _add("no_resolve_very_high_entropy_sld", weights.get('no_resolve_very_high_entropy_sld', 15))
+    elif res.sld_entropy > 3.8:
+        _add("no_resolve_high_entropy_sld", weights.get('no_resolve_high_entropy_sld', 10))
+
+    # Clamp score
+    nr_score = max(0, min(nr_score, 100))
+
+    return {
+        "score": nr_score,
+        "signals": nr_signals,
+        "breakdown": nr_breakdown,
+    }
+
+
 def calculate_score(res: DomainApprovalResult, config: dict) -> None:
     score = 0
     signals: Set[str] = set()
@@ -5846,6 +6187,84 @@ def calculate_score(res: DomainApprovalResult, config: dict) -> None:
             breakdown[signal] = breakdown.get(signal, 0) + points
             score += points
     
+    # === NO WEB PRESENCE: UNIFIED DNS-ONLY SCORING PATH (v8.2) ===
+    # Both mail-only (no A, has MX) and no-resolve (no A, no MX) domains
+    # go through the same scoring function. Neither has a website, so they
+    # get identical scrutiny. The only difference is which missing-record
+    # indicators fire.
+    if res.is_mail_only_domain or res.is_no_resolve_domain:
+        nr = calculate_no_resolve_score(res, config)
+
+        # Store in the appropriate result fields
+        if res.is_mail_only_domain:
+            res.mail_only_dns_score = nr["score"]
+            res.mail_only_dns_signals = ";".join(nr["signals"])
+            res.mail_only_dns_breakdown = json.dumps(nr["breakdown"])
+        if res.is_no_resolve_domain:
+            res.no_resolve_dns_score = nr["score"]
+            res.no_resolve_dns_signals = ";".join(nr["signals"])
+            res.no_resolve_dns_breakdown = json.dumps(nr["breakdown"])
+
+        # Use the unified score as the risk score
+        res.risk_score = nr["score"]
+        bands = [(0, 19, "LOW"), (20, 39, "MEDIUM"), (40, 64, "HIGH"), (65, 84, "CRITICAL"), (85, 999, "SEVERE")]
+        res.risk_level = next((l for lo, hi, l in bands if lo <= res.risk_score <= hi), "UNKNOWN")
+        res.recommendation = "APPROVE" if res.risk_score < threshold else "DENY"
+        res.signals_triggered = ";".join(sorted(nr["signals"]))
+        res.score_breakdown = json.dumps(nr["breakdown"])
+
+        # Build summary — label differs based on which path
+        if res.is_no_resolve_domain:
+            _label = f"🔇 NO-RESOLVE DOMAIN — no A, no MX (score: {nr['score']})"
+        else:
+            _mx_type = res.mail_only_mx_provider_type or res.mx_provider_type or ""
+            _label = f"📧 MAIL-ONLY DOMAIN — no A, has MX{f' ({_mx_type})' if _mx_type else ''} (score: {nr['score']})"
+
+        _summary_parts = [_label]
+        if res.cannot_receive_mail:
+            _summary_parts.append("📭 Cannot receive mail")
+        if res.domain_age_days >= 0:
+            _summary_parts.append(f"Age: {res.domain_age_days}d")
+        if res.vt_available:
+            if res.vt_malicious_count > 0:
+                _summary_parts.append(f"VT: {res.vt_malicious_count} malicious")
+            else:
+                _summary_parts.append("VT: clean")
+        if res.domain_blacklist_count > 0:
+            _summary_parts.append(f"DNSBL: {res.domain_blacklist_count} hits")
+        if res.ns_is_enterprise:
+            _summary_parts.append("NS: enterprise")
+        elif res.ns_is_parking:
+            _summary_parts.append("NS: parking")
+        elif res.ns_is_lame_delegation:
+            _summary_parts.append("NS: lame")
+        if res.dnssec_enabled:
+            _summary_parts.append("DNSSEC")
+        if res.ct_log_count > 0:
+            _summary_parts.append(f"CT: {res.ct_log_count} certs")
+        elif res.ct_log_count == 0:
+            _summary_parts.append("CT: none")
+        if res.soa_serial_is_date and res.soa_days_since_serial >= 0:
+            if res.soa_days_since_serial <= 90:
+                _summary_parts.append("SOA: fresh")
+            elif res.soa_days_since_serial > 365:
+                _summary_parts.append("SOA: stale")
+        if res.sld_entropy > 3.8:
+            _summary_parts.append(f"Entropy: {res.sld_entropy}")
+        # Email auth summary
+        if not res.spf_exists and not res.dkim_exists and not res.dmarc_exists:
+            _summary_parts.append("Auth: none")
+        else:
+            _auth_parts = []
+            if res.spf_exists: _auth_parts.append("SPF")
+            if res.dkim_exists: _auth_parts.append("DKIM")
+            if res.dmarc_exists: _auth_parts.append(f"DMARC:{res.dmarc_policy or '?'}")
+            _summary_parts.append(f"Auth: {'+'.join(_auth_parts)}")
+        if res.registration_opaque:
+            _summary_parts.append("WHOIS: opaque")
+        res.summary = f"{res.recommendation}: {' | '.join(_summary_parts)}"
+        return
+
     # Email Auth - these are DELIVERABILITY concerns only, NOT fraud signals
     # A domain missing these should get warnings, not denial
     if not res.spf_exists:
@@ -6129,7 +6548,9 @@ def calculate_score(res: DomainApprovalResult, config: dict) -> None:
         add("ecommerce_no_identity", weights.get('ecommerce_no_identity', 15))
     
     # Web/TLS
-    if not res.https_valid:
+    # Suppress no_https for domains with no A record — they can never have HTTPS,
+    # so this would always double-count against the no-resolve base penalty.
+    if not res.https_valid and not (res.is_mail_only_domain or res.is_no_resolve_domain):
         add("no_https", weights.get('no_https', 25))
     
     # v4.4: TLS failure markers — tracked for summary/rules but scored at 0.
@@ -7188,24 +7609,48 @@ def analyze_domain(domain: str, timeout: float = 10.0, check_rdap: bool = True,
                 pass
         
         if not res.resolved:
-            res.recommendation = "DENY"
-            res.summary = "DENY: Domain does not resolve"
-            res.risk_level = "ERROR"
-            res.risk_score = 100
-            return asdict(res)
+            # v8.0: Mail-only domain detection — before hard DENY, check if domain has valid MX records.
+            # Email-only domains (no website, no A record) are legitimate for customers who only
+            # need to send email. If valid MX exists, continue with DNS-only scoring instead of denying.
+            _mail_only_mx_exists, _mail_only_mx_records, _mail_only_mx_is_null = get_mx(domain)
+            if _mail_only_mx_exists and not _mail_only_mx_is_null:
+                # Domain has valid MX — treat as mail-only domain
+                res.is_mail_only_domain = True
+                res.mail_only_mx_records = ";".join(f"{p}:{h}" for p, h in _mail_only_mx_records)
+                res.mail_only_mx_provider_type = classify_mx_provider(_mail_only_mx_records, domain, config)
+                res.mail_only_note = (
+                    f"📧 MAIL-ONLY DOMAIN: {domain} has no A record but has valid MX "
+                    f"({res.mail_only_mx_provider_type}). Running DNS-based evaluation."
+                )
+                # Set resolved=True conceptually so we continue, but ip_address stays empty
+                # The rest of the function will detect is_mail_only_domain and skip HTTP checks
+            else:
+                # v8.1: No-resolve domain detection — domain has no A record AND no valid MX.
+                # Instead of hard-denying, score using available DNS signals (WHOIS, VT,
+                # typosquatting, DNSBL, NS risk, domain patterns). This lets established,
+                # clean domains pass while still catching suspicious ones.
+                res.is_no_resolve_domain = True
+                res.cannot_receive_mail = True
+                res.no_resolve_note = (
+                    f"🔇 NO-RESOLVE DOMAIN: {domain} has no A record and no valid MX. "
+                    f"Cannot receive mail. Running DNS-based evaluation."
+                )
     
-    # PTR
-    res.ptr_exists, res.ptr_record, res.ptr_matches_forward = get_ptr_record(res.ip_address)
+    # PTR (requires IP — skip for mail-only and no-resolve domains)
+    if not res.is_mail_only_domain and not res.is_no_resolve_domain:
+        res.ptr_exists, res.ptr_record, res.ptr_matches_forward = get_ptr_record(res.ip_address)
     
     # Domain characteristics
     domain_lower = domain.lower()
     res.is_suspicious_tld = any(domain_lower.endswith(t) for t in config['suspicious_tlds'])
     res.is_retail_scam_tld = any(domain_lower.endswith(t) for t in RETAIL_SCAM_TLDS)
+    res.is_free_registration_tld = any(domain_lower.endswith(t) for t in config.get('free_registration_tlds', []))
     res.is_free_email_domain = domain_lower in FREE_EMAIL_PROVIDERS
     res.is_free_hosting = any(p in domain_lower for p in FREE_HOSTING_PATTERNS)
     res.is_url_shortener = domain_lower in URL_SHORTENERS
     res.is_disposable_email = is_disposable_email(domain_lower, config['disposable_domains'])
     res.typosquat_target, res.typosquat_similarity = check_typosquatting(domain, config['protected_brands'])
+    res.sld_entropy = calculate_domain_entropy(domain)
     
     # v7.3.1: Homoglyph / IDN spoofing detection
     homoglyph = check_homoglyph_domain(domain, config['protected_brands'])
@@ -7336,46 +7781,51 @@ def analyze_domain(domain: str, timeout: float = 10.0, check_rdap: bool = True,
     res.domain_blacklist_count = bl_count
     res.domain_blacklist_inconclusive = bl_inconclusive
     
-    ip_bl_hits, ip_bl_count, ip_bl_inconclusive = check_ip_blacklists(res.ip_address, config['ip_blacklists'])
-    res.ip_blacklists_hit = ";".join(ip_bl_hits)
-    res.ip_blacklist_count = ip_bl_count
-    res.ip_blacklist_inconclusive = ip_bl_inconclusive
-    
+    # IP blacklists and hosting detection require an IP address — skip for mail-only and no-resolve domains
+    if not res.is_mail_only_domain and not res.is_no_resolve_domain:
+        ip_bl_hits, ip_bl_count, ip_bl_inconclusive = check_ip_blacklists(res.ip_address, config['ip_blacklists'])
+        res.ip_blacklists_hit = ";".join(ip_bl_hits)
+        res.ip_blacklist_count = ip_bl_count
+        res.ip_blacklist_inconclusive = ip_bl_inconclusive
+
     # Hosting Provider Detection
     ns_records = dns_query(domain, 'NS')
-    hosting_result = check_hosting_provider(
-        domain, res.ip_address, 
-        ns_records=ns_records, 
-        ptr_record=res.ptr_record,
-        hosting_config=config
-    )
-    res.hosting_provider = hosting_result["provider"]
-    res.hosting_provider_type = hosting_result["provider_type"]
-    res.hosting_detected_via = hosting_result["detected_via"]
-    res.hosting_asn = hosting_result["asn"]
-    res.hosting_asn_org = hosting_result["asn_org"]
+    if not res.is_mail_only_domain and not res.is_no_resolve_domain:
+        hosting_result = check_hosting_provider(
+            domain, res.ip_address,
+            ns_records=ns_records,
+            ptr_record=res.ptr_record,
+            hosting_config=config
+        )
+        res.hosting_provider = hosting_result["provider"]
+        res.hosting_provider_type = hosting_result["provider_type"]
+        res.hosting_detected_via = hosting_result["detected_via"]
+        res.hosting_asn = hosting_result["asn"]
+        res.hosting_asn_org = hosting_result["asn_org"]
     
-    # v7.3.1: CDN Provider Detection
-    res.is_cdn_hosted, res.cdn_provider = detect_cdn_hosted(res.hosting_asn)
-    
-    # v7.3.1: Subdomain Delegation Abuse Detection
-    sub_result = detect_subdomain_delegation_abuse(
-        submitted_domain=domain,
-        submitted_ip=res.ip_address,
-        submitted_asn=res.hosting_asn,
-        submitted_mx_provider_type=res.mx_provider_type,
-        config=config,
-    )
-    res.is_subdomain = sub_result["is_subdomain"]
-    res.parent_domain = sub_result["parent_domain"]
-    res.parent_ip = sub_result["parent_ip"]
-    res.parent_asn = sub_result["parent_asn"]
-    res.parent_asn_org = sub_result["parent_asn_org"]
-    res.parent_mx_provider_type = sub_result["parent_mx_provider_type"]
-    if sub_result["divergent"]:
-        res.subdomain_infra_divergent = True
-        res.subdomain_divergence_evidence = ";".join(sub_result["evidence"])
-        res.subdomain_divergence_confidence = sub_result["confidence"]
+    # v7.3.1: CDN Provider Detection (requires IP/ASN — skip for mail-only and no-resolve)
+    if not res.is_mail_only_domain and not res.is_no_resolve_domain:
+        res.is_cdn_hosted, res.cdn_provider = detect_cdn_hosted(res.hosting_asn)
+
+    # v7.3.1: Subdomain Delegation Abuse Detection (requires IP — skip for mail-only and no-resolve)
+    if not res.is_mail_only_domain and not res.is_no_resolve_domain:
+        sub_result = detect_subdomain_delegation_abuse(
+            submitted_domain=domain,
+            submitted_ip=res.ip_address,
+            submitted_asn=res.hosting_asn,
+            submitted_mx_provider_type=res.mx_provider_type,
+            config=config,
+        )
+        res.is_subdomain = sub_result["is_subdomain"]
+        res.parent_domain = sub_result["parent_domain"]
+        res.parent_ip = sub_result["parent_ip"]
+        res.parent_asn = sub_result["parent_asn"]
+        res.parent_asn_org = sub_result["parent_asn_org"]
+        res.parent_mx_provider_type = sub_result["parent_mx_provider_type"]
+        if sub_result["divergent"]:
+            res.subdomain_infra_divergent = True
+            res.subdomain_divergence_evidence = ";".join(sub_result["evidence"])
+            res.subdomain_divergence_confidence = sub_result["confidence"]
     
     # === STAGING / SDLC SUBDOMAIN DETECTION ===
     # Prefixes that unambiguously indicate a non-production environment:
@@ -7415,453 +7865,493 @@ def analyze_domain(domain: str, timeout: float = 10.0, check_rdap: bool = True,
     res.ns_free_dns_match = ns_risk["free_dns_match"]
     res.ns_is_lame_delegation = ns_risk["is_lame_delegation"]
     res.ns_is_single_ns = ns_risk["is_single_ns"]
-    
-    # TLS — v4.4: now captures handshake_failed and connection_failed separately
-    tls = check_tls(domain, timeout)
-    res.https_valid = tls["ok"]
-    res.tls_error = tls["error"]
-    res.tls_handshake_failed = tls["handshake_failed"]       # v4.4
-    res.tls_connection_failed = tls["connection_failed"]     # v4.4
-    res.cert_self_signed = tls["self_signed"]
-    res.cert_expired = tls["expired"]
-    res.cert_wrong_host = tls["wrong_host"]
-    
-    # HTTP check
-    if REQUESTS_AVAILABLE:
-        try:
-            r = requests.head(f"http://{domain}", timeout=timeout, allow_redirects=False, verify=False)
-            res.http_reachable = r.status_code in [200, 301, 302, 307, 308]
-            res.http_status = r.status_code
-        except:
-            pass
-    
-    # HTTPS with redirects + content
-    https_result = follow_redirects(f"https://{domain}", timeout, fetch_content=True)
-    res.https_reachable = https_result["ok"]
-    res.https_status = https_result["initial_status"]
-    res.redirect_count = https_result["hops"]
-    res.redirect_chain = "→".join(str(s) for s in https_result["chain"])
-    res.redirect_domains = "→".join(https_result["domains"])
-    res.redirect_cross_domain = https_result["cross_domain"]
-    res.redirect_uses_temp = https_result["uses_temp"]
-    res.final_url = https_result["final_url"]
-    res.content_length = https_result["content_length"]
-    
-    all_statuses = https_result["all_statuses"]
-    res.status_codes_seen = ";".join(str(s) for s in sorted(all_statuses) if s > 0)
-    res.has_401 = 401 in all_statuses
-    res.has_403 = 403 in all_statuses
-    res.has_429 = 429 in all_statuses
-    res.has_503 = 503 in all_statuses
-    res.has_5xx = bool(all_statuses & {500, 502, 504})
-    
-    # Access restriction detection - 401 on what should be a public site is suspicious
-    # NOTE: 403 is intentionally excluded — too many FPs from Cloudflare/WAF bot protection.
-    # A legitimate domain like bahcemarket.com (21yr, VT clean, App Store) gets 403 from
-    # Cloudflare when our scanner hits it; that's not a fraud signal.
-    if res.has_401:
-        res.is_access_restricted = True
-        res.access_restriction_note = "401 Unauthorized - requires authentication for public site"
-    
-    # Content analysis
-    content = https_result["content"]
-    if not content and res.http_reachable:
-        http_result = follow_redirects(f"http://{domain}", timeout, fetch_content=True)
-        content = http_result["content"]
-        res.content_length = http_result["content_length"]
-    
-    # === EMPTY PAGE DETECTION ===
-    # A reachable domain that returns empty/near-empty content is suspicious
-    # (parked, abandoned, or stripped after compromise)
-    # But 403/5xx responses aren't "empty" — they're blocked/broken, different signal
-    if res.https_reachable or res.http_reachable:
-        if not (res.is_access_restricted or res.has_5xx or res.has_503):
-            if not content or len(content.strip()) < 50:
-                res.is_empty_page = True
-    
-    if content:
-        res.content_hash = hashlib.md5(content).hexdigest()[:12]
-        ca = analyze_content(content, res.final_url, domain)
-        res.is_minimal_shell = ca["minimal_shell"]
-        res.has_js_redirect = ca["js_redirect"]
-        res.has_meta_refresh = ca["meta_refresh"]
-        res.has_external_js = ca["external_js"]
-        res.has_obfuscation = ca["obfuscation"]
-        res.has_credential_form = ca["credential_form"]
-        res.has_sensitive_fields = ca["sensitive_fields"]
-        res.brands_detected = ";".join(ca["brands"])
-        res.form_posts_external = ca["form_external"]
-        res.malware_links_found = ";".join(ca["malware"])
-        res.has_suspicious_iframe = ca["suspicious_iframe"]
-        res.is_parking_page = ca["parking"]
-        res.phishing_paths_found = ";".join(ca["phishing_paths"])
+    res.ns_is_enterprise = ns_risk["is_enterprise_ns"]
+    res.ns_enterprise_match = ns_risk.get("enterprise_ns_match", "")
+
+    # v8.1: SOA freshness check (DNS-only, runs for all domains)
+    soa = check_soa_freshness(domain)
+    res.soa_exists = soa["soa_exists"]
+    res.soa_serial = soa["soa_serial"]
+    res.soa_serial_is_date = soa["soa_serial_is_date"]
+    res.soa_serial_date = soa["soa_serial_date"]
+    res.soa_days_since_serial = soa["soa_days_since_serial"]
+
+    # v8.1: DNSSEC check (DNS-only, runs for all domains)
+    res.dnssec_enabled = check_dnssec(domain)
+
+    # === WEB CHECKS (TLS, HTTP, content, hacklink, etc.) ===
+    # Mail-only and no-resolve domains have no A record / website — skip all web-dependent checks.
+    # DNS-only checks (VT, RDAP/WHOIS) run separately after this block.
+    content = None  # Initialize for mail-only/no-resolve path (used by later sections)
+    if not res.is_mail_only_domain and not res.is_no_resolve_domain:
+        # TLS — v4.4: now captures handshake_failed and connection_failed separately
+        tls = check_tls(domain, timeout)
+        res.https_valid = tls["ok"]
+        res.tls_error = tls["error"]
+        res.tls_handshake_failed = tls["handshake_failed"]       # v4.4
+        res.tls_connection_failed = tls["connection_failed"]     # v4.4
+        res.cert_self_signed = tls["self_signed"]
+        res.cert_expired = tls["expired"]
+        res.cert_wrong_host = tls["wrong_host"]
         
-        # === PARKING PAGE FALSE POSITIVE SUPPRESSION (v7.5) ===
-        # Parking pages (HugeDomains, Sedo, GoDaddy, etc.) contain brand references
-        # from payment processing (Chase, PayPal, Stripe) and purchase forms that
-        # POST to the parking provider domain.  These trigger brand_impersonation +
-        # form_posts_external, which fires the phishing kit composite = false autofail.
-        #
-        # When parking is confirmed, suppress:
-        #   1. brands_detected — payment processor refs are not impersonation
-        #   2. form_posts_external — only if form target is a known parking domain
+        # HTTP check
+        if REQUESTS_AVAILABLE:
+            try:
+                r = requests.head(f"http://{domain}", timeout=timeout, allow_redirects=False, verify=False)
+                res.http_reachable = r.status_code in [200, 301, 302, 307, 308]
+                res.http_status = r.status_code
+            except:
+                pass
+        
+        # HTTPS with redirects + content
+        https_result = follow_redirects(f"https://{domain}", timeout, fetch_content=True)
+        res.https_reachable = https_result["ok"]
+        res.https_status = https_result["initial_status"]
+        res.redirect_count = https_result["hops"]
+        res.redirect_chain = "→".join(str(s) for s in https_result["chain"])
+        res.redirect_domains = "→".join(https_result["domains"])
+        res.redirect_cross_domain = https_result["cross_domain"]
+        res.redirect_uses_temp = https_result["uses_temp"]
+        res.final_url = https_result["final_url"]
+        res.content_length = https_result["content_length"]
+        
+        all_statuses = https_result["all_statuses"]
+        res.status_codes_seen = ";".join(str(s) for s in sorted(all_statuses) if s > 0)
+        res.has_401 = 401 in all_statuses
+        res.has_403 = 403 in all_statuses
+        res.has_429 = 429 in all_statuses
+        res.has_503 = 503 in all_statuses
+        res.has_5xx = bool(all_statuses & {500, 502, 504})
+        
+        # Access restriction detection - 401 on what should be a public site is suspicious
+        # NOTE: 403 is intentionally excluded — too many FPs from Cloudflare/WAF bot protection.
+        # A legitimate domain like bahcemarket.com (21yr, VT clean, App Store) gets 403 from
+        # Cloudflare when our scanner hits it; that's not a fraud signal.
+        if res.has_401:
+            res.is_access_restricted = True
+            res.access_restriction_note = "401 Unauthorized - requires authentication for public site"
+        
+        # Content analysis
+        content = https_result["content"]
+        if not content and res.http_reachable:
+            http_result = follow_redirects(f"http://{domain}", timeout, fetch_content=True)
+            content = http_result["content"]
+            res.content_length = http_result["content_length"]
+        
+        # === EMPTY PAGE DETECTION ===
+        # A reachable domain that returns empty/near-empty content is suspicious
+        # (parked, abandoned, or stripped after compromise)
+        # But 403/5xx responses aren't "empty" — they're blocked/broken, different signal
+        if res.https_reachable or res.http_reachable:
+            if not (res.is_access_restricted or res.has_5xx or res.has_503):
+                if not content or len(content.strip()) < 50:
+                    res.is_empty_page = True
+        
+        if content:
+            res.content_hash = hashlib.md5(content).hexdigest()[:12]
+            ca = analyze_content(content, res.final_url, domain)
+            res.is_minimal_shell = ca["minimal_shell"]
+            res.has_js_redirect = ca["js_redirect"]
+            res.has_meta_refresh = ca["meta_refresh"]
+            res.has_external_js = ca["external_js"]
+            res.has_obfuscation = ca["obfuscation"]
+            res.has_credential_form = ca["credential_form"]
+            res.has_sensitive_fields = ca["sensitive_fields"]
+            res.brands_detected = ";".join(ca["brands"])
+            res.form_posts_external = ca["form_external"]
+            res.malware_links_found = ";".join(ca["malware"])
+            res.has_suspicious_iframe = ca["suspicious_iframe"]
+            res.is_parking_page = ca["parking"]
+            res.phishing_paths_found = ";".join(ca["phishing_paths"])
+            
+            # === PARKING PAGE FALSE POSITIVE SUPPRESSION (v7.5) ===
+            # Parking pages (HugeDomains, Sedo, GoDaddy, etc.) contain brand references
+            # from payment processing (Chase, PayPal, Stripe) and purchase forms that
+            # POST to the parking provider domain.  These trigger brand_impersonation +
+            # form_posts_external, which fires the phishing kit composite = false autofail.
+            #
+            # When parking is confirmed, suppress:
+            #   1. brands_detected — payment processor refs are not impersonation
+            #   2. form_posts_external — only if form target is a known parking domain
+            if res.is_parking_page:
+                # Suppress brand detection entirely on parking pages
+                if res.brands_detected:
+                    res.brands_detected = ""
+                
+                # Suppress form_posts_external if the target is a known parking domain
+                if res.form_posts_external:
+                    _form_actions = re.findall(
+                        rb'<form[^>]+action=["\']([^"\']+)["\']',
+                        content.lower() if isinstance(content, bytes) else content.encode().lower()
+                    )
+                    _all_parking = True
+                    for _fa in _form_actions:
+                        try:
+                            _fa_url = _fa.decode('utf-8', errors='ignore')
+                            if _fa_url.startswith(('http://', 'https://')):
+                                _fa_host = urlparse(_fa_url).netloc.lower()
+                                if _fa_host and _fa_host != urlparse(res.final_url).netloc.lower():
+                                    if _fa_host not in KNOWN_PARKING_DOMAINS:
+                                        _all_parking = False
+                                        break
+                        except Exception:
+                            pass
+                    if _all_parking:
+                        res.form_posts_external = False
+            
+            # Phishing kit detection (v7.3)
+            if ca["kit_filename"]:
+                res.has_phishing_kit_filename = True
+                res.phishing_kit_filename = ca["kit_filename"]
+                res.phishing_kit_filename_strong = ca["kit_filename_strong"]
+            if ca["exfil_signals"]:
+                res.has_exfil_drop_script = True
+                res.exfil_drop_signals = ";".join(ca["exfil_signals"])
+                res.exfil_drop_details = ";".join(ca["exfil_details"])
+            
+            # Client-side harvest detection (v7.5)
+            if ca["harvest_signals"]:
+                res.has_harvest_signals = True
+                res.harvest_signals = ";".join(ca["harvest_signals"])
+                res.harvest_details = ";".join(ca["harvest_details"])
+            if ca["harvest_combo"]:
+                res.has_harvest_combo = True
+                res.harvest_combo_reason = ca["harvest_combo_reason"]
+            
+            # v7.4: Form action kit filename + suspicious page title
+            if ca["form_action_kit"]:
+                res.has_form_action_kit = True
+                res.form_action_kit_target = ca["form_action_kit"]
+                res.form_action_kit_strong = ca["form_action_kit_strong"]
+            if ca["page_title"]:
+                res.page_title = ca["page_title"]
+            if ca["suspicious_title_match"]:
+                res.has_suspicious_page_title = True
+                res.page_title_match = ca["suspicious_title_match"]
+            
+            # v7.3.1: OAuth consent phishing
+            if ca.get("oauth_phish"):
+                res.has_oauth_phish = True
+                res.oauth_phish_evidence = ";".join(ca["oauth_evidence"])
+            
+            # v7.5.1: Security tooling detection (reCAPTCHA, Cloudflare, hCaptcha, etc.)
+            if ca.get("security_signals"):
+                res.content_security_signals = ";".join(ca["security_signals"])
+        
+        # Check for hijacked domain / stepping stone indicators
+        redirect_chain_urls = res.redirect_chain.split(' → ') if res.redirect_chain else []
+        hijack = check_hijacked_domain_indicators(content, res.final_url, redirect_chain_urls)
+        res.has_hijack_path_pattern = hijack["has_hijack_path"]
+        res.hijack_path_found = hijack["hijack_path"]
+        res.has_doc_sharing_lure = hijack["has_doc_lure"]
+        res.doc_lure_found = hijack["doc_lure"]
+        res.has_phishing_js_behavior = hijack["has_phishing_js"]
+        res.phishing_js_patterns = ";".join(hijack["phishing_js_found"])
+        res.redirects_to_phishing_infra = hijack["redirects_to_phishing_infra"]
+        res.phishing_infra_domain = hijack["phishing_infra"]
+        res.has_email_in_url = hijack["has_email_in_url"]
+        res.url_email_tracking = hijack["email_tracking"]
+        
+        # E-commerce / retail scam detection
+        if content:
+            ecom = analyze_ecommerce_indicators(content, domain)
+            res.is_ecommerce_site = ecom["is_ecommerce"]
+            
+            res.has_cross_domain_brand_link = len(ecom["cross_domain_brand_links"]) > 0
+            res.cross_domain_brand_links = ";".join(ecom["cross_domain_brand_links"])
+            
+            # Check business identity - especially important for e-commerce
+            if ecom["is_ecommerce"]:
+                res.missing_business_identity = not ecom["has_business_identity"]
+                found_signals = ecom["business_identity_signals"]
+                missing_signals = ecom["missing_identity_signals"]
+                res.business_identity_signals = f"found:{';'.join(found_signals)}|missing:{';'.join(missing_signals)}"
+        
+        # Corporate trust signal check - only if we got a 401/403 or couldn't reach the site
+        # A domain that blocks access AND has no trust pages is highly suspicious
+        if res.is_access_restricted or res.is_minimal_shell or not res.https_reachable:
+            trust_signals = check_corporate_trust_signals(domain, timeout=3.0)
+            res.trust_pages_checked = ";".join(trust_signals["pages_checked"])
+            res.trust_pages_found = ";".join(trust_signals["pages_found"])
+            res.missing_trust_signals = trust_signals["missing_trust_signals"]
+            
+            # If access is restricted AND no trust signals found, mark as opaque entity
+            if res.is_access_restricted and res.missing_trust_signals:
+                res.is_opaque_entity = True
+        
+        # App Store Presence Detection (legitimacy signal)
+        if APP_STORE_DETECTION_AVAILABLE:
+            try:
+                app_result = check_app_store_presence(domain, content=content, timeout=5.0)
+                res.app_store_has_presence = app_result.get("has_any_app_presence", False)
+                res.app_store_confidence = app_result.get("confidence", "none")
+                res.app_store_ios_verified = app_result.get("ios_aasa", {}).get("exists", False)
+                res.app_store_android_verified = app_result.get("android_asset_links", {}).get("exists", False)
+                res.app_store_page_links = app_result.get("has_app_store_links", False)
+                res.app_store_itunes_match = app_result.get("has_itunes_match", False)
+                res.app_store_ios_app_ids = app_result.get("app_store_ios_app_ids", "")
+                res.app_store_android_packages = app_result.get("app_store_android_packages", "")
+                res.app_store_methods_found = app_result.get("app_store_methods_found", "")
+                res.app_store_summary = " | ".join(app_result.get("summary_lines", []))
+            except Exception:
+                pass  # Non-critical — don't break analysis if app store check fails
+        
+        # TLD Variant Spoofing Detection
+        # Check if signup domain is a TLD variant of an established business
+        # e.g., gordondown.uk spoofing gordondown.co.uk
+        try:
+            tld_variant = check_tld_variant_spoofing(domain, signup_content=content, timeout=timeout)
+            res.tld_variant_detected = tld_variant["tld_variant_detected"]
+            res.tld_variant_domain = tld_variant["variant_domain"]
+            res.tld_variant_has_content = tld_variant["variant_has_content"]
+            res.tld_variant_has_email_infra = tld_variant["variant_has_email_infra"]
+            res.tld_variant_domain_age_days = tld_variant["variant_domain_age_days"]
+            res.tld_variant_content_words = tld_variant["variant_content_words"]
+            res.tld_variant_signup_content_words = tld_variant["signup_content_words"]
+            res.tld_variant_summary = tld_variant["summary"]
+            
+            # TLD variant allowlist: suppress for domains explicitly cleared by admin review
+            tld_variant_allowlist = [d.lower().strip() for d in config.get('tld_variant_allowlist', [])]
+            if res.tld_variant_detected:
+                if domain_lower in tld_variant_allowlist or any(domain_lower.endswith('.' + a) for a in tld_variant_allowlist):
+                    res.tld_variant_detected = False
+                    res.tld_variant_summary = f"ALLOWLISTED — {res.tld_variant_domain} variant suppressed by admin"
+            
+            # v7.5.1: UK TLD variant dark detection
+            # When a .co.uk variant has NO DNS, this is an infrastructure signal:
+            # - On ESTABLISHED domains: suggests domain takeover or shell domain where
+            #   the .co.uk was abandoned/never held by the attacker
+            # - On NEW domains: expected behavior (owner only registered .com)
+            summary_lower = (res.tld_variant_summary or "").lower()
+            if "co.uk: no dns" in summary_lower or ".co.uk: no dns" in summary_lower:
+                # Extract the dark variant domain from the summary
+                import re as _re_uk
+                _uk_match = _re_uk.search(r'(\S+\.co\.uk):\s*no dns', summary_lower)
+                if _uk_match:
+                    res.tld_variant_uk_no_dns = True
+                    res.tld_variant_uk_no_dns_domain = _uk_match.group(1)
+        except Exception as e:
+            # Surface error in results so it's visible during debugging
+            res.tld_variant_summary = f"CHECK ERROR: {type(e).__name__}: {str(e)[:200]}"
+        
+        # === VIRUSTOTAL REPUTATION CHECK ===
+        # Uses the VT API to check domain reputation across 70+ security vendors
+        vt_api_key = src.get('vt_api_key', '') or os.environ.get('VT_API_KEY', '')
+        if VT_CHECKER_AVAILABLE and vt_api_key:
+            try:
+                vt = VirusTotalChecker(api_key=vt_api_key)
+                vt_result = vt.check_domain(domain)
+                res.vt_available = vt_result.get("vt_available", False)
+                res.vt_malicious_count = vt_result.get("malicious_count", 0)
+                res.vt_suspicious_count = vt_result.get("suspicious_count", 0)
+                res.vt_total_vendors = vt_result.get("total_vendors", 0)
+                res.vt_detection_rate = vt_result.get("detection_rate", 0.0)
+                res.vt_community_score = vt_result.get("community_score", 0)
+                res.vt_reputation = vt_result.get("reputation", 0)
+                res.vt_threat_names = ";".join(vt_result.get("threat_names", []))
+                res.vt_malicious_vendors = ";".join(vt_result.get("malicious_vendors", []))
+                res.vt_categories = json.dumps(vt_result.get("categories", {}))
+                res.vt_last_analysis = vt_result.get("last_analysis_date", "") or ""
+            except Exception:
+                pass  # Non-critical — don't break analysis if VT check fails
+        
+        # === HACKLINK / SEO SPAM DETECTION ===
+        # Scans page content for Turkish hacklink injection, gambling keywords, 
+        # WordPress compromise indicators, and hidden SEO spam
+        if HACKLINK_SCANNER_AVAILABLE:
+            try:
+                hl_scanner = HacklinkKeywordScanner(timeout=int(timeout))
+                # Pass pre-fetched content to avoid double-fetching
+                content_str = content.decode('utf-8', errors='replace') if isinstance(content, bytes) else content
+                hl_result = hl_scanner.scan(domain, content=content_str)
+                res.hacklink_detected = hl_result.get("hacklink_detected", False)
+                res.hacklink_score = hl_result.get("score", 0)
+                res.hacklink_keywords = ";".join(hl_result.get("keywords_found", []))
+                res.hacklink_injection_patterns = ";".join(hl_result.get("injection_patterns", []))
+                res.hacklink_is_wordpress = hl_result.get("is_wordpress", False)
+                res.hacklink_wp_compromised = hl_result.get("wp_compromised", False)
+                vuln_plugins = hl_result.get("vulnerable_plugins", [])
+                if vuln_plugins:
+                    res.hacklink_vulnerable_plugins = ";".join(
+                        f"{p.get('plugin','')}({p.get('risk','')})" if isinstance(p, dict) else str(p)
+                        for p in vuln_plugins
+                    )
+                res.hacklink_spam_link_count = hl_result.get("spam_link_count", 0)
+                spam_urls = hl_result.get("spam_link_urls", [])
+                if spam_urls:
+                    res.hacklink_spam_links_found = ";".join(spam_urls[:20])
+                
+                # === Extract sub-signals for individual scoring ===
+                res.hacklink_is_cpanel = hl_result.get("is_cpanel", False)
+                
+                # Parse injection_patterns for malicious_script and hidden_injection flags
+                inj_patterns = hl_result.get("injection_patterns", [])
+                # v7.2: Use multi-signal confidence instead of binary pattern matching
+                ms_confidence = hl_result.get("malicious_script_confidence", "NONE")
+                res.hacklink_malicious_script = ms_confidence in ("HIGH", "MEDIUM")
+                res.hacklink_malicious_script_confidence = ms_confidence
+                ms_signals = hl_result.get("malicious_script_signals", [])
+                res.hacklink_malicious_script_signals = ";".join(ms_signals) if ms_signals else ""
+                res.hacklink_malicious_script_score = hl_result.get("malicious_script_score", 0)
+                res.hacklink_hidden_injection = any("hidden_content" in p for p in inj_patterns)
+                res.hacklink_hidden_injection_confidence = hl_result.get("hidden_injection_confidence", "")
+                
+                # Suspicious external scripts
+                sus_scripts = hl_result.get("suspicious_scripts", [])
+                if sus_scripts:
+                    res.hacklink_suspicious_scripts = ";".join(sus_scripts[:10])
+            except Exception:
+                pass  # Non-critical — don't break analysis if hacklink check fails
+        
+        # === ECOMMERCE DETECTION VIA WOOCOMMERCE PLUGIN (v7.5.1) ===
+        # The hacklink scanner detects WP plugins (including WooCommerce) during its
+        # scan.  If content-based ecommerce detection missed it (e.g., TLS failure
+        # preventing full page render), WooCommerce in the plugin list confirms it.
+        if not res.is_ecommerce_site and res.hacklink_vulnerable_plugins:
+            if "woocommerce" in res.hacklink_vulnerable_plugins.lower():
+                res.is_ecommerce_site = True
+        
+        # === ECOMMERCE SHIPPING BRAND SUPPRESSION (v7.5.1) ===
+        # On confirmed e-commerce sites with established domains (90+ days),
+        # shipping/logistics brand mentions (UPS, FedEx, DHL, USPS) are expected
+        # business content, not brand impersonation.  Strip shipping-only brands
+        # from brands_detected to prevent combo rules from cascading
+        # (brand_imp + cred_form = 20pts, brand_imp + no_https = 20pts).
+        # If non-shipping brands are also present (e.g., "paypal"), keep those.
+        # MUST run after both ecommerce detection AND hacklink scanner (for WooCommerce).
+        if res.is_ecommerce_site and res.brands_detected:
+            _ecom_age_ok = res.domain_age_days < 0 or res.domain_age_days >= 90
+            if _ecom_age_ok:
+                _detected_brands = [b.strip().lower() for b in res.brands_detected.split(";") if b.strip()]
+                _non_shipping = [b for b in _detected_brands if b not in ECOMMERCE_SHIPPING_BRANDS]
+                if _non_shipping:
+                    res.brands_detected = ";".join(_non_shipping)
+                else:
+                    res.brands_detected = ""
+        
+        # === PARKING PAGE SIGNAL SUPPRESSION (v7.5.1) ===
+        # Parking pages (HugeDomains, Sedo, etc.) generate false signals from the parking
+        # provider's template.  The scoring suppression in calculate_score() prevents points,
+        # but the RAW BOOLEANS still leak into UI threat indicators and pattern displays.
+        # Clear them here so the entire pipeline sees clean data.
         if res.is_parking_page:
-            # Suppress brand detection entirely on parking pages
-            if res.brands_detected:
-                res.brands_detected = ""
+            # Malicious script: CookieYes/HugeDomains analytics scripts → SocGholish FP
+            if res.hacklink_malicious_script:
+                _ext = [d.strip().lower() for d in
+                        (res.content_external_script_domains or "").split(";") if d.strip()]
+                if _ext:
+                    _unknown = [d for d in _ext if d not in KNOWN_PARKING_SCRIPT_DOMAINS]
+                    if not _unknown:
+                        res.hacklink_malicious_script = False
+                        res.hacklink_malicious_script_confidence = ""
+                        res.hacklink_malicious_script_signals = ""
+                        res.hacklink_malicious_script_score = 0
+                else:
+                    _ms_sigs = set((res.hacklink_malicious_script_signals or "").split(";"))
+                    if _ms_sigs.issubset({"UNKNOWN_EXTERNAL_SCRIPT", "HIGH_ENTROPY_PATH",
+                                          "JQUERY_MASQUERADE", ""}):
+                        res.hacklink_malicious_script = False
+                        res.hacklink_malicious_script_confidence = ""
+                        res.hacklink_malicious_script_signals = ""
+                        res.hacklink_malicious_script_score = 0
             
-            # Suppress form_posts_external if the target is a known parking domain
-            if res.form_posts_external:
-                _form_actions = re.findall(
-                    rb'<form[^>]+action=["\']([^"\']+)["\']',
-                    content.lower() if isinstance(content, bytes) else content.encode().lower()
-                )
-                _all_parking = True
-                for _fa in _form_actions:
-                    try:
-                        _fa_url = _fa.decode('utf-8', errors='ignore')
-                        if _fa_url.startswith(('http://', 'https://')):
-                            _fa_host = urlparse(_fa_url).netloc.lower()
-                            if _fa_host and _fa_host != urlparse(res.final_url).netloc.lower():
-                                if _fa_host not in KNOWN_PARKING_DOMAINS:
-                                    _all_parking = False
-                                    break
-                    except Exception:
-                        pass
-                if _all_parking:
-                    res.form_posts_external = False
-        
-        # Phishing kit detection (v7.3)
-        if ca["kit_filename"]:
-            res.has_phishing_kit_filename = True
-            res.phishing_kit_filename = ca["kit_filename"]
-            res.phishing_kit_filename_strong = ca["kit_filename_strong"]
-        if ca["exfil_signals"]:
-            res.has_exfil_drop_script = True
-            res.exfil_drop_signals = ";".join(ca["exfil_signals"])
-            res.exfil_drop_details = ";".join(ca["exfil_details"])
-        
-        # Client-side harvest detection (v7.5)
-        if ca["harvest_signals"]:
-            res.has_harvest_signals = True
-            res.harvest_signals = ";".join(ca["harvest_signals"])
-            res.harvest_details = ";".join(ca["harvest_details"])
-        if ca["harvest_combo"]:
-            res.has_harvest_combo = True
-            res.harvest_combo_reason = ca["harvest_combo_reason"]
-        
-        # v7.4: Form action kit filename + suspicious page title
-        if ca["form_action_kit"]:
-            res.has_form_action_kit = True
-            res.form_action_kit_target = ca["form_action_kit"]
-            res.form_action_kit_strong = ca["form_action_kit_strong"]
-        if ca["page_title"]:
-            res.page_title = ca["page_title"]
-        if ca["suspicious_title_match"]:
-            res.has_suspicious_page_title = True
-            res.page_title_match = ca["suspicious_title_match"]
-        
-        # v7.3.1: OAuth consent phishing
-        if ca.get("oauth_phish"):
-            res.has_oauth_phish = True
-            res.oauth_phish_evidence = ";".join(ca["oauth_evidence"])
-        
-        # v7.5.1: Security tooling detection (reCAPTCHA, Cloudflare, hCaptcha, etc.)
-        if ca.get("security_signals"):
-            res.content_security_signals = ";".join(ca["security_signals"])
-    
-    # Check for hijacked domain / stepping stone indicators
-    redirect_chain_urls = res.redirect_chain.split(' → ') if res.redirect_chain else []
-    hijack = check_hijacked_domain_indicators(content, res.final_url, redirect_chain_urls)
-    res.has_hijack_path_pattern = hijack["has_hijack_path"]
-    res.hijack_path_found = hijack["hijack_path"]
-    res.has_doc_sharing_lure = hijack["has_doc_lure"]
-    res.doc_lure_found = hijack["doc_lure"]
-    res.has_phishing_js_behavior = hijack["has_phishing_js"]
-    res.phishing_js_patterns = ";".join(hijack["phishing_js_found"])
-    res.redirects_to_phishing_infra = hijack["redirects_to_phishing_infra"]
-    res.phishing_infra_domain = hijack["phishing_infra"]
-    res.has_email_in_url = hijack["has_email_in_url"]
-    res.url_email_tracking = hijack["email_tracking"]
-    
-    # E-commerce / retail scam detection
-    if content:
-        ecom = analyze_ecommerce_indicators(content, domain)
-        res.is_ecommerce_site = ecom["is_ecommerce"]
-        
-        res.has_cross_domain_brand_link = len(ecom["cross_domain_brand_links"]) > 0
-        res.cross_domain_brand_links = ";".join(ecom["cross_domain_brand_links"])
-        
-        # Check business identity - especially important for e-commerce
-        if ecom["is_ecommerce"]:
-            res.missing_business_identity = not ecom["has_business_identity"]
-            found_signals = ecom["business_identity_signals"]
-            missing_signals = ecom["missing_identity_signals"]
-            res.business_identity_signals = f"found:{';'.join(found_signals)}|missing:{';'.join(missing_signals)}"
-    
-    # Corporate trust signal check - only if we got a 401/403 or couldn't reach the site
-    # A domain that blocks access AND has no trust pages is highly suspicious
-    if res.is_access_restricted or res.is_minimal_shell or not res.https_reachable:
-        trust_signals = check_corporate_trust_signals(domain, timeout=3.0)
-        res.trust_pages_checked = ";".join(trust_signals["pages_checked"])
-        res.trust_pages_found = ";".join(trust_signals["pages_found"])
-        res.missing_trust_signals = trust_signals["missing_trust_signals"]
-        
-        # If access is restricted AND no trust signals found, mark as opaque entity
-        if res.is_access_restricted and res.missing_trust_signals:
-            res.is_opaque_entity = True
-    
-    # App Store Presence Detection (legitimacy signal)
-    if APP_STORE_DETECTION_AVAILABLE:
-        try:
-            app_result = check_app_store_presence(domain, content=content, timeout=5.0)
-            res.app_store_has_presence = app_result.get("has_any_app_presence", False)
-            res.app_store_confidence = app_result.get("confidence", "none")
-            res.app_store_ios_verified = app_result.get("ios_aasa", {}).get("exists", False)
-            res.app_store_android_verified = app_result.get("android_asset_links", {}).get("exists", False)
-            res.app_store_page_links = app_result.get("has_app_store_links", False)
-            res.app_store_itunes_match = app_result.get("has_itunes_match", False)
-            res.app_store_ios_app_ids = app_result.get("app_store_ios_app_ids", "")
-            res.app_store_android_packages = app_result.get("app_store_android_packages", "")
-            res.app_store_methods_found = app_result.get("app_store_methods_found", "")
-            res.app_store_summary = " | ".join(app_result.get("summary_lines", []))
-        except Exception:
-            pass  # Non-critical — don't break analysis if app store check fails
-    
-    # TLD Variant Spoofing Detection
-    # Check if signup domain is a TLD variant of an established business
-    # e.g., gordondown.uk spoofing gordondown.co.uk
-    try:
-        tld_variant = check_tld_variant_spoofing(domain, signup_content=content, timeout=timeout)
-        res.tld_variant_detected = tld_variant["tld_variant_detected"]
-        res.tld_variant_domain = tld_variant["variant_domain"]
-        res.tld_variant_has_content = tld_variant["variant_has_content"]
-        res.tld_variant_has_email_infra = tld_variant["variant_has_email_infra"]
-        res.tld_variant_domain_age_days = tld_variant["variant_domain_age_days"]
-        res.tld_variant_content_words = tld_variant["variant_content_words"]
-        res.tld_variant_signup_content_words = tld_variant["signup_content_words"]
-        res.tld_variant_summary = tld_variant["summary"]
-        
-        # TLD variant allowlist: suppress for domains explicitly cleared by admin review
-        tld_variant_allowlist = [d.lower().strip() for d in config.get('tld_variant_allowlist', [])]
-        if res.tld_variant_detected:
-            if domain_lower in tld_variant_allowlist or any(domain_lower.endswith('.' + a) for a in tld_variant_allowlist):
-                res.tld_variant_detected = False
-                res.tld_variant_summary = f"ALLOWLISTED — {res.tld_variant_domain} variant suppressed by admin"
-        
-        # v7.5.1: UK TLD variant dark detection
-        # When a .co.uk variant has NO DNS, this is an infrastructure signal:
-        # - On ESTABLISHED domains: suggests domain takeover or shell domain where
-        #   the .co.uk was abandoned/never held by the attacker
-        # - On NEW domains: expected behavior (owner only registered .com)
-        summary_lower = (res.tld_variant_summary or "").lower()
-        if "co.uk: no dns" in summary_lower or ".co.uk: no dns" in summary_lower:
-            # Extract the dark variant domain from the summary
-            import re as _re_uk
-            _uk_match = _re_uk.search(r'(\S+\.co\.uk):\s*no dns', summary_lower)
-            if _uk_match:
-                res.tld_variant_uk_no_dns = True
-                res.tld_variant_uk_no_dns_domain = _uk_match.group(1)
-    except Exception as e:
-        # Surface error in results so it's visible during debugging
-        res.tld_variant_summary = f"CHECK ERROR: {type(e).__name__}: {str(e)[:200]}"
-    
-    # === VIRUSTOTAL REPUTATION CHECK ===
-    # Uses the VT API to check domain reputation across 70+ security vendors
-    vt_api_key = src.get('vt_api_key', '') or os.environ.get('VT_API_KEY', '')
-    if VT_CHECKER_AVAILABLE and vt_api_key:
-        try:
-            vt = VirusTotalChecker(api_key=vt_api_key)
-            vt_result = vt.check_domain(domain)
-            res.vt_available = vt_result.get("vt_available", False)
-            res.vt_malicious_count = vt_result.get("malicious_count", 0)
-            res.vt_suspicious_count = vt_result.get("suspicious_count", 0)
-            res.vt_total_vendors = vt_result.get("total_vendors", 0)
-            res.vt_detection_rate = vt_result.get("detection_rate", 0.0)
-            res.vt_community_score = vt_result.get("community_score", 0)
-            res.vt_reputation = vt_result.get("reputation", 0)
-            res.vt_threat_names = ";".join(vt_result.get("threat_names", []))
-            res.vt_malicious_vendors = ";".join(vt_result.get("malicious_vendors", []))
-            res.vt_categories = json.dumps(vt_result.get("categories", {}))
-            res.vt_last_analysis = vt_result.get("last_analysis_date", "") or ""
-        except Exception:
-            pass  # Non-critical — don't break analysis if VT check fails
-    
-    # === HACKLINK / SEO SPAM DETECTION ===
-    # Scans page content for Turkish hacklink injection, gambling keywords, 
-    # WordPress compromise indicators, and hidden SEO spam
-    if HACKLINK_SCANNER_AVAILABLE:
-        try:
-            hl_scanner = HacklinkKeywordScanner(timeout=int(timeout))
-            # Pass pre-fetched content to avoid double-fetching
-            content_str = content.decode('utf-8', errors='replace') if isinstance(content, bytes) else content
-            hl_result = hl_scanner.scan(domain, content=content_str)
-            res.hacklink_detected = hl_result.get("hacklink_detected", False)
-            res.hacklink_score = hl_result.get("score", 0)
-            res.hacklink_keywords = ";".join(hl_result.get("keywords_found", []))
-            res.hacklink_injection_patterns = ";".join(hl_result.get("injection_patterns", []))
-            res.hacklink_is_wordpress = hl_result.get("is_wordpress", False)
-            res.hacklink_wp_compromised = hl_result.get("wp_compromised", False)
-            vuln_plugins = hl_result.get("vulnerable_plugins", [])
-            if vuln_plugins:
-                res.hacklink_vulnerable_plugins = ";".join(
-                    f"{p.get('plugin','')}({p.get('risk','')})" if isinstance(p, dict) else str(p)
-                    for p in vuln_plugins
-                )
-            res.hacklink_spam_link_count = hl_result.get("spam_link_count", 0)
-            spam_urls = hl_result.get("spam_link_urls", [])
-            if spam_urls:
-                res.hacklink_spam_links_found = ";".join(spam_urls[:20])
+            # UK variant dark: parking domain is for sale — .co.uk is irrelevant
+            if res.tld_variant_uk_no_dns:
+                res.tld_variant_uk_no_dns = False
+                res.tld_variant_uk_no_dns_domain = ""
             
-            # === Extract sub-signals for individual scoring ===
-            res.hacklink_is_cpanel = hl_result.get("is_cpanel", False)
-            
-            # Parse injection_patterns for malicious_script and hidden_injection flags
-            inj_patterns = hl_result.get("injection_patterns", [])
-            # v7.2: Use multi-signal confidence instead of binary pattern matching
-            ms_confidence = hl_result.get("malicious_script_confidence", "NONE")
-            res.hacklink_malicious_script = ms_confidence in ("HIGH", "MEDIUM")
-            res.hacklink_malicious_script_confidence = ms_confidence
-            ms_signals = hl_result.get("malicious_script_signals", [])
-            res.hacklink_malicious_script_signals = ";".join(ms_signals) if ms_signals else ""
-            res.hacklink_malicious_script_score = hl_result.get("malicious_script_score", 0)
-            res.hacklink_hidden_injection = any("hidden_content" in p for p in inj_patterns)
-            res.hacklink_hidden_injection_confidence = hl_result.get("hidden_injection_confidence", "")
-            
-            # Suspicious external scripts
-            sus_scripts = hl_result.get("suspicious_scripts", [])
-            if sus_scripts:
-                res.hacklink_suspicious_scripts = ";".join(sus_scripts[:10])
-        except Exception:
-            pass  # Non-critical — don't break analysis if hacklink check fails
-    
-    # === ECOMMERCE DETECTION VIA WOOCOMMERCE PLUGIN (v7.5.1) ===
-    # The hacklink scanner detects WP plugins (including WooCommerce) during its
-    # scan.  If content-based ecommerce detection missed it (e.g., TLS failure
-    # preventing full page render), WooCommerce in the plugin list confirms it.
-    if not res.is_ecommerce_site and res.hacklink_vulnerable_plugins:
-        if "woocommerce" in res.hacklink_vulnerable_plugins.lower():
-            res.is_ecommerce_site = True
-    
-    # === ECOMMERCE SHIPPING BRAND SUPPRESSION (v7.5.1) ===
-    # On confirmed e-commerce sites with established domains (90+ days),
-    # shipping/logistics brand mentions (UPS, FedEx, DHL, USPS) are expected
-    # business content, not brand impersonation.  Strip shipping-only brands
-    # from brands_detected to prevent combo rules from cascading
-    # (brand_imp + cred_form = 20pts, brand_imp + no_https = 20pts).
-    # If non-shipping brands are also present (e.g., "paypal"), keep those.
-    # MUST run after both ecommerce detection AND hacklink scanner (for WooCommerce).
-    if res.is_ecommerce_site and res.brands_detected:
-        _ecom_age_ok = res.domain_age_days < 0 or res.domain_age_days >= 90
-        if _ecom_age_ok:
-            _detected_brands = [b.strip().lower() for b in res.brands_detected.split(";") if b.strip()]
-            _non_shipping = [b for b in _detected_brands if b not in ECOMMERCE_SHIPPING_BRANDS]
-            if _non_shipping:
-                res.brands_detected = ";".join(_non_shipping)
-            else:
-                res.brands_detected = ""
-    
-    # === PARKING PAGE SIGNAL SUPPRESSION (v7.5.1) ===
-    # Parking pages (HugeDomains, Sedo, etc.) generate false signals from the parking
-    # provider's template.  The scoring suppression in calculate_score() prevents points,
-    # but the RAW BOOLEANS still leak into UI threat indicators and pattern displays.
-    # Clear them here so the entire pipeline sees clean data.
-    if res.is_parking_page:
-        # Malicious script: CookieYes/HugeDomains analytics scripts → SocGholish FP
-        if res.hacklink_malicious_script:
-            _ext = [d.strip().lower() for d in
-                    (res.content_external_script_domains or "").split(";") if d.strip()]
-            if _ext:
-                _unknown = [d for d in _ext if d not in KNOWN_PARKING_SCRIPT_DOMAINS]
-                if not _unknown:
-                    res.hacklink_malicious_script = False
-                    res.hacklink_malicious_script_confidence = ""
-                    res.hacklink_malicious_script_signals = ""
-                    res.hacklink_malicious_script_score = 0
-            else:
-                _ms_sigs = set((res.hacklink_malicious_script_signals or "").split(";"))
-                if _ms_sigs.issubset({"UNKNOWN_EXTERNAL_SCRIPT", "HIGH_ENTROPY_PATH",
-                                      "JQUERY_MASQUERADE", ""}):
-                    res.hacklink_malicious_script = False
-                    res.hacklink_malicious_script_confidence = ""
-                    res.hacklink_malicious_script_signals = ""
-                    res.hacklink_malicious_script_score = 0
+            # Hidden injection: parking template CSS (display:none for menus/modals)
+            # Only suppress LOW confidence (no hidden links = just CSS patterns)
+            if res.hacklink_hidden_injection and res.hacklink_hidden_injection_confidence == "LOW":
+                res.hacklink_hidden_injection = False
+                res.hacklink_hidden_injection_confidence = ""
         
-        # UK variant dark: parking domain is for sale — .co.uk is irrelevant
-        if res.tld_variant_uk_no_dns:
-            res.tld_variant_uk_no_dns = False
-            res.tld_variant_uk_no_dns_domain = ""
+        # === CONTENT IDENTITY VERIFICATION ===
+        # Scans page content for identity mismatches, cloned content, cross-domain
+        # email references, domain broker facades, and placeholder pages.
+        # Reuses pre-fetched content — no duplicate HTTP requests.
+        if CONTENT_CHECKS_AVAILABLE:
+            try:
+                content_str = content.decode('utf-8', errors='replace') if isinstance(content, bytes) else content
+                cc = check_content_identity(domain, content=content_str)
+                res.content_title_body_mismatch = cc.get("title_body_mismatch", False)
+                res.content_title_body_detail = cc.get("title_body_mismatch_detail", "")
+                xd_emails = cc.get("cross_domain_emails", [])
+                if xd_emails:
+                    res.content_cross_domain_emails = ";".join(xd_emails[:10])
+                xd_domains = cc.get("cross_domain_email_domains", [])
+                if xd_domains:
+                    res.content_cross_domain_email_domains = ";".join(xd_domains[:10])
+                priv_emails = cc.get("page_privacy_emails", [])
+                if priv_emails:
+                    res.content_page_privacy_emails = ";".join(priv_emails[:10])
+                free_emails = cc.get("page_freemail_contacts", [])
+                if free_emails:
+                    res.content_page_freemail_contacts = ";".join(free_emails[:10])
+                res.content_is_broker_page = cc.get("is_broker_page", False)
+                broker_ind = cc.get("broker_indicators", [])
+                if broker_ind:
+                    res.content_broker_indicators = ";".join(broker_ind[:10])
+                res.content_is_placeholder = cc.get("is_placeholder", False)
+                page_emails = cc.get("page_emails", [])
+                if page_emails:
+                    res.content_page_emails = ";".join(page_emails[:20])
+                page_phones = cc.get("page_phones", [])
+                if page_phones:
+                    res.content_page_phones = ";".join(page_phones[:10])
+                res.content_identity_hash = cc.get("content_hash", "")
+                res.content_structure_hash = cc.get("structure_hash", "")
+                res.content_is_facade = cc.get("is_content_facade", False)
+                res.content_facade_detail = cc.get("facade_detail", "")
+                res.content_spa_framework_detected = cc.get("spa_framework_detected", False)
+                res.content_spa_framework_name = cc.get("spa_framework_name", "")
+                ext_scripts = cc.get("external_script_domains", [])
+                if ext_scripts:
+                    res.content_external_script_domains = ";".join(ext_scripts[:10])
+                ext_links = cc.get("external_link_domains", [])
+                if ext_links:
+                    res.content_external_link_domains = ";".join(ext_links[:20])
+                res.content_visible_word_count = cc.get("visible_word_count", -1)
+            except Exception:
+                pass  # Non-critical — don't break analysis if content check fails
         
-        # Hidden injection: parking template CSS (display:none for menus/modals)
-        # Only suppress LOW confidence (no hidden links = just CSS patterns)
-        if res.hacklink_hidden_injection and res.hacklink_hidden_injection_confidence == "LOW":
-            res.hacklink_hidden_injection = False
-            res.hacklink_hidden_injection_confidence = ""
-    
-    # === CONTENT IDENTITY VERIFICATION ===
-    # Scans page content for identity mismatches, cloned content, cross-domain
-    # email references, domain broker facades, and placeholder pages.
-    # Reuses pre-fetched content — no duplicate HTTP requests.
-    if CONTENT_CHECKS_AVAILABLE:
+        # === CONTACT CROSS-REFERENCE (OSINT) ===
+        # Search web for emails/phones found on the page appearing on other domains.
+        # Informational only — helps analysts spot coordinated campaigns.
         try:
-            content_str = content.decode('utf-8', errors='replace') if isinstance(content, bytes) else content
-            cc = check_content_identity(domain, content=content_str)
-            res.content_title_body_mismatch = cc.get("title_body_mismatch", False)
-            res.content_title_body_detail = cc.get("title_body_mismatch_detail", "")
-            xd_emails = cc.get("cross_domain_emails", [])
-            if xd_emails:
-                res.content_cross_domain_emails = ";".join(xd_emails[:10])
-            xd_domains = cc.get("cross_domain_email_domains", [])
-            if xd_domains:
-                res.content_cross_domain_email_domains = ";".join(xd_domains[:10])
-            priv_emails = cc.get("page_privacy_emails", [])
-            if priv_emails:
-                res.content_page_privacy_emails = ";".join(priv_emails[:10])
-            free_emails = cc.get("page_freemail_contacts", [])
-            if free_emails:
-                res.content_page_freemail_contacts = ";".join(free_emails[:10])
-            res.content_is_broker_page = cc.get("is_broker_page", False)
-            broker_ind = cc.get("broker_indicators", [])
-            if broker_ind:
-                res.content_broker_indicators = ";".join(broker_ind[:10])
-            res.content_is_placeholder = cc.get("is_placeholder", False)
-            page_emails = cc.get("page_emails", [])
-            if page_emails:
-                res.content_page_emails = ";".join(page_emails[:20])
-            page_phones = cc.get("page_phones", [])
-            if page_phones:
-                res.content_page_phones = ";".join(page_phones[:10])
-            res.content_identity_hash = cc.get("content_hash", "")
-            res.content_structure_hash = cc.get("structure_hash", "")
-            res.content_is_facade = cc.get("is_content_facade", False)
-            res.content_facade_detail = cc.get("facade_detail", "")
-            res.content_spa_framework_detected = cc.get("spa_framework_detected", False)
-            res.content_spa_framework_name = cc.get("spa_framework_name", "")
-            ext_scripts = cc.get("external_script_domains", [])
-            if ext_scripts:
-                res.content_external_script_domains = ";".join(ext_scripts[:10])
-            ext_links = cc.get("external_link_domains", [])
-            if ext_links:
-                res.content_external_link_domains = ";".join(ext_links[:20])
-            res.content_visible_word_count = cc.get("visible_word_count", -1)
+            from contact_osint import search_contact_reuse
+            import json as _json
+            _emails = res.content_page_emails.split(";") if res.content_page_emails else []
+            _phones = res.content_page_phones.split(";") if res.content_page_phones else []
+            if _emails or _phones:
+                _osint = search_contact_reuse(_emails, _phones, domain, timeout=8)
+                if _osint.get("matches"):
+                    res.contact_reuse_results = _json.dumps(_osint)
         except Exception:
-            pass  # Non-critical — don't break analysis if content check fails
+            pass  # Non-critical — never break analysis for OSINT lookup failure
     
-    # === CONTACT CROSS-REFERENCE (OSINT) ===
-    # Search web for emails/phones found on the page appearing on other domains.
-    # Informational only — helps analysts spot coordinated campaigns.
-    try:
-        from contact_osint import search_contact_reuse
-        import json as _json
-        _emails = res.content_page_emails.split(";") if res.content_page_emails else []
-        _phones = res.content_page_phones.split(";") if res.content_page_phones else []
-        if _emails or _phones:
-            _osint = search_contact_reuse(_emails, _phones, domain, timeout=8)
-            if _osint.get("matches"):
-                res.contact_reuse_results = _json.dumps(_osint)
-    except Exception:
-        pass  # Non-critical — never break analysis for OSINT lookup failure
-    
+    # === VIRUSTOTAL FOR MAIL-ONLY AND NO-RESOLVE DOMAINS ===
+    # VT is DNS-based (no HTTP needed) — run it for mail-only and no-resolve domains too
+    if res.is_mail_only_domain or res.is_no_resolve_domain:
+        vt_api_key = src.get('vt_api_key', '') or os.environ.get('VT_API_KEY', '')
+        if VT_CHECKER_AVAILABLE and vt_api_key:
+            try:
+                vt = VirusTotalChecker(api_key=vt_api_key)
+                vt_result = vt.check_domain(domain)
+                res.vt_available = vt_result.get("vt_available", False)
+                res.vt_malicious_count = vt_result.get("malicious_count", 0)
+                res.vt_suspicious_count = vt_result.get("suspicious_count", 0)
+                res.vt_total_vendors = vt_result.get("total_vendors", 0)
+                res.vt_detection_rate = vt_result.get("detection_rate", 0.0)
+                res.vt_community_score = vt_result.get("community_score", 0)
+                res.vt_reputation = vt_result.get("reputation", 0)
+                res.vt_threat_names = ";".join(vt_result.get("threat_names", []))
+                res.vt_malicious_vendors = ";".join(vt_result.get("malicious_vendors", []))
+                res.vt_categories = json.dumps(vt_result.get("categories", {}))
+                res.vt_last_analysis = vt_result.get("last_analysis_date", "") or ""
+            except Exception:
+                pass
+
     # RDAP
     if check_rdap:
         res.rdap_created, res.domain_age_days, _is_rereg, _rereg_date = rdap_lookup(domain, timeout)
@@ -8040,5 +8530,13 @@ def analyze_domain(domain: str, timeout: float = 10.0, check_rdap: bool = True,
     # v7.5.1: Prepend root domain fallback note to summary if applicable
     if res.analyzed_root_note:
         res.summary = f"{res.analyzed_root_note} | {res.summary}"
-    
+
+    # v8.0: Prepend mail-only domain note to summary if applicable
+    if res.mail_only_note:
+        res.summary = f"{res.mail_only_note} | {res.summary}"
+
+    # v8.1: Prepend no-resolve domain note to summary if applicable
+    if res.no_resolve_note:
+        res.summary = f"{res.no_resolve_note} | {res.summary}"
+
     return asdict(res)
