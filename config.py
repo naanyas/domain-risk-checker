@@ -254,7 +254,7 @@ DEFAULT_CONFIG = {
 
         # === MAIL-ONLY DOMAIN SCORING (v8.0) ===
         # Weights for domains with no A record but valid MX (email-only domains).
-        # These are evaluated via calculate_mail_only_score() using DNS-only signals.
+        # These are evaluated via calculate_no_resolve_score() using DNS-only signals.
         # Positive = risk, negative = legitimacy bonus.
         "mail_only_no_spf": 8,                  # Missing SPF on mail-only domain
         "mail_only_no_dkim": 8,                 # Missing DKIM on mail-only domain
