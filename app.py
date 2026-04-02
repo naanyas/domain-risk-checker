@@ -368,9 +368,9 @@ def display_results(results: list):
             else:
                 return 'background-color: #f8d7da'
         
-        styled_df = summary_df.style.applymap(
+        styled_df = summary_df.style.map(
             color_recommendation, subset=['recommendation']
-        ).applymap(
+        ).map(
             color_score, subset=['risk_score']
         )
         
