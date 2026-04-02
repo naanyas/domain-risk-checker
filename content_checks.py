@@ -481,6 +481,9 @@ def check_content_identity(domain: str, content: str = "") -> Dict:
     for email in emails:
         if "@" not in email:
             continue
+        # Skip image filenames that look like emails (common in HTML)
+        if any(email.lower().endswith(ext) for ext in (".png", ".jpg", ".svg", ".gif", ".webp")):
+            continue
         local_part, email_domain = email.split("@", 1)
         email_domain = email_domain.lower()
         local_lower = local_part.lower()
@@ -500,6 +503,9 @@ def check_content_identity(domain: str, content: str = "") -> Dict:
     # ── CHECK 4: Privacy / freemail / disposable on page ──
     for email in emails:
         if "@" not in email:
+            continue
+        # Skip image filenames that look like emails (common in HTML)
+        if any(email.lower().endswith(ext) for ext in (".png", ".jpg", ".svg", ".gif", ".webp")):
             continue
         local_part = email.split("@", 1)[0].lower()
         email_domain = email.split("@")[1].lower()
