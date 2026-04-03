@@ -5180,7 +5180,21 @@ def generate_summary(res: DomainApprovalResult, signals: Set[str], rdap_enabled:
             all_issues.append(f"VT THREAT NAMES: {names}")
         if res.vt_malicious_count == 0 and res.vt_suspicious_count == 0 and res.vt_total_vendors >= 50:
             positives.append(f"VT CLEAN → 0/{res.vt_total_vendors} security vendors flag this domain")
-    
+
+    # === EXTERNAL THREAT INTEL (Google Safe Browsing, URLhaus, PhishTank, AbuseIPDB) ===
+    if res.gsb_listed:
+        threats = res.gsb_threat_types.replace(";", ", ") if res.gsb_threat_types else "unknown"
+        all_issues.append(f"🛡️ GOOGLE SAFE BROWSING ({threats}) → Domain flagged by Google's threat detection")
+    if res.urlhaus_listed:
+        tag_info = f" (tags: {res.urlhaus_tags.replace(';', ', ')})" if res.urlhaus_tags else ""
+        online = f", {res.urlhaus_urls_online} online" if res.urlhaus_urls_online else ""
+        all_issues.append(f"🛡️ URLHAUS LISTED ({res.urlhaus_url_count} malware URLs{online}{tag_info}) → Domain hosts known malware")
+    if res.phishtank_listed:
+        verified = "VERIFIED" if res.phishtank_verified else "reported"
+        all_issues.append(f"🛡️ PHISHTANK {verified} → Domain has {verified} phishing URLs")
+    if res.abuseipdb_available and res.abuseipdb_score >= 25:
+        all_issues.append(f"🛡️ ABUSEIPDB SCORE {res.abuseipdb_score}% ({res.abuseipdb_reports} reports) → IP has abuse reports")
+
     # === HACKLINK / SEO SPAM ===
     if res.hacklink_detected:
         kw = res.hacklink_keywords.replace(";", ", ")[:80] if res.hacklink_keywords else "various"
@@ -6121,6 +6135,25 @@ def calculate_no_resolve_score(res, config: dict) -> dict:
         elif res.vt_malicious_count == 0 and res.vt_total_vendors > 0:
             _add("no_resolve_vt_clean", weights.get('no_resolve_vt_clean', -5))
 
+    # --- EXTERNAL THREAT INTEL (same weights as main scoring) ---
+    if res.gsb_listed:
+        _add("no_resolve_gsb_listed", weights.get('gsb_listed', 65))
+    if res.urlhaus_listed:
+        if res.urlhaus_urls_online > 0:
+            _add("no_resolve_urlhaus_active", weights.get('urlhaus_active', 65))
+        else:
+            _add("no_resolve_urlhaus_historical", weights.get('urlhaus_historical', 22))
+    if res.phishtank_listed:
+        if res.phishtank_verified:
+            _add("no_resolve_phishtank_verified", weights.get('phishtank_verified', 65))
+        else:
+            _add("no_resolve_phishtank_reported", weights.get('phishtank_reported', 22))
+    if res.abuseipdb_available:
+        if res.abuseipdb_score >= 75:
+            _add("no_resolve_abuseipdb_high", weights.get('abuseipdb_high', 40))
+        elif res.abuseipdb_score >= 25:
+            _add("no_resolve_abuseipdb_medium", weights.get('abuseipdb_medium', 15))
+
     # --- TYPOSQUATTING / HOMOGLYPH ---
     if res.typosquat_target:
         _add("no_resolve_typosquat", weights.get('no_resolve_typosquat', 15))
@@ -6259,6 +6292,14 @@ def calculate_score(res: DomainApprovalResult, config: dict) -> None:
                 _summary_parts.append(f"VT: {res.vt_malicious_count} malicious")
             else:
                 _summary_parts.append("VT: clean")
+        # Threat intel flags (GSB, URLhaus, PhishTank, AbuseIPDB)
+        _ti_flags = []
+        if res.gsb_listed: _ti_flags.append("GSB")
+        if res.urlhaus_listed: _ti_flags.append("URLhaus")
+        if res.phishtank_listed: _ti_flags.append("PhishTank")
+        if res.abuseipdb_score >= 25: _ti_flags.append(f"AbuseIPDB:{res.abuseipdb_score}%")
+        if _ti_flags:
+            _summary_parts.append(f"⚠️ {', '.join(_ti_flags)}")
         if res.domain_blacklist_count > 0:
             _summary_parts.append(f"DNSBL: {res.domain_blacklist_count} hits")
         if res.ns_is_enterprise:
@@ -6769,7 +6810,28 @@ def calculate_score(res: DomainApprovalResult, config: dict) -> None:
             # v7.5.1: Unless facade was de-escalated by SPA trust signals
             if not res.content_is_facade or "content_facade" not in signals:
                 add("vt_clean", weights.get('vt_clean', -5))
-    
+
+    # === EXTERNAL THREAT INTEL SCORING ===
+    # Google Safe Browsing, URLhaus, PhishTank, AbuseIPDB — scored using same
+    # tiers as VT to keep threat intel signals consistent.
+    if res.gsb_listed:
+        add("gsb_listed", weights.get('gsb_listed', 65))
+    if res.urlhaus_listed:
+        if res.urlhaus_urls_online > 0:
+            add("urlhaus_active", weights.get('urlhaus_active', 65))
+        else:
+            add("urlhaus_historical", weights.get('urlhaus_historical', 22))
+    if res.phishtank_listed:
+        if res.phishtank_verified:
+            add("phishtank_verified", weights.get('phishtank_verified', 65))
+        else:
+            add("phishtank_reported", weights.get('phishtank_reported', 22))
+    if res.abuseipdb_available:
+        if res.abuseipdb_score >= 75:
+            add("abuseipdb_high", weights.get('abuseipdb_high', 40))
+        elif res.abuseipdb_score >= 25:
+            add("abuseipdb_medium", weights.get('abuseipdb_medium', 15))
+
     # === HACKLINK / SEO SPAM SCORING ===
     if res.hacklink_detected:
         add("hacklink_detected", weights.get('hacklink_detected', 50))
