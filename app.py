@@ -10,6 +10,8 @@ import pandas as pd
 import json
 import copy
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from io import BytesIO
 
@@ -96,13 +98,15 @@ def parse_domains(text: str) -> list:
 
 
 def run_analysis(domains: list, config: dict, progress_callback=None) -> list:
-    """Run domain analysis with current config."""
-    results = []
-    for i, domain in enumerate(domains):
-        if progress_callback:
-            progress_callback(i, len(domains), domain)
+    """Run domain analysis with current config. Processes domains in parallel."""
+    max_workers = config.get('max_workers', 5)
+    results = [None] * len(domains)  # Pre-allocate to preserve input ordering
+    completed_count = [0]  # Mutable counter for closure access
+    lock = threading.Lock()
+
+    def analyze_one(index, domain):
         try:
-            result = analyze_domain(
+            return index, analyze_domain(
                 domain=domain,
                 timeout=config.get('timeout', 10.0),
                 check_rdap=config.get('check_rdap', True),
@@ -110,16 +114,29 @@ def run_analysis(domains: list, config: dict, progress_callback=None) -> list:
                 threshold=config.get('approve_threshold', 50),
                 full_config=config,
             )
-            results.append(result)
         except Exception as e:
-            # Create error result
-            results.append({
+            return index, {
                 'domain': domain,
                 'risk_score': 100,
                 'recommendation': 'DENY',
                 'summary': f'Analysis failed: {str(e)[:100]}',
-                'risk_level': 'ERROR'
-            })
+                'risk_level': 'ERROR',
+            }
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(analyze_one, i, d): i
+            for i, d in enumerate(domains)
+        }
+        for future in as_completed(futures):
+            idx, result = future.result()
+            results[idx] = result
+            with lock:
+                completed_count[0] += 1
+                if progress_callback:
+                    progress_callback(completed_count[0] - 1, len(domains),
+                                      result.get('domain', '') if isinstance(result, dict) else '')
+
     return results
 
 

@@ -27,6 +27,7 @@ import socket
 import ssl
 import hashlib
 import difflib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, fields, asdict
 from datetime import datetime, timezone
 from typing import Optional, Tuple, List, Dict, Set
@@ -78,6 +79,12 @@ try:
     CONTENT_CHECKS_AVAILABLE = True
 except Exception:
     CONTENT_CHECKS_AVAILABLE = False
+
+try:
+    from threat_intel import check_google_safebrowsing, check_urlhaus, check_phishtank, check_abuseipdb
+    THREAT_INTEL_AVAILABLE = True
+except Exception:
+    THREAT_INTEL_AVAILABLE = False
 
 
 # ============================================================================
@@ -361,7 +368,29 @@ class DomainApprovalResult:
     vt_malicious_vendors: str = ""               # Semicolon-separated vendor names flagging malicious
     vt_categories: str = ""                      # JSON of vendor->category mappings
     vt_last_analysis: str = ""                   # Last VT analysis date
-    
+
+    # === GOOGLE SAFE BROWSING ===
+    gsb_available: bool = False                  # True if GSB API key was configured and query succeeded
+    gsb_listed: bool = False                     # True if domain is flagged
+    gsb_threat_types: str = ""                   # Semicolon-separated: MALWARE, SOCIAL_ENGINEERING, etc.
+
+    # === URLHAUS / ABUSE.CH ===
+    urlhaus_available: bool = False              # True if query succeeded
+    urlhaus_listed: bool = False                 # True if domain has known malware URLs
+    urlhaus_url_count: int = 0                   # Total malware URLs associated
+    urlhaus_urls_online: int = 0                 # Currently active malware URLs
+    urlhaus_tags: str = ""                       # Semicolon-separated threat tags
+
+    # === PHISHTANK ===
+    phishtank_available: bool = False            # True if query succeeded
+    phishtank_listed: bool = False               # True if domain has phishing URLs
+    phishtank_verified: bool = False             # True if phishing is verified (not just reported)
+
+    # === ABUSEIPDB ===
+    abuseipdb_available: bool = False            # True if API key was configured and query succeeded
+    abuseipdb_score: int = 0                     # Abuse confidence score (0-100)
+    abuseipdb_reports: int = 0                   # Total abuse reports in last 90 days
+
     # === HACKLINK / SEO SPAM DETECTION ===
     hacklink_detected: bool = False              # True if hacklink SEO spam injection detected
     hacklink_score: int = 0                      # Hacklink module risk score (0-30)
@@ -7699,8 +7728,69 @@ def analyze_domain(domain: str, timeout: float = 10.0, check_rdap: bool = True,
         res.is_homoglyph_domain = False
         res.homoglyph_target = ""
     
-    # SPF
-    spf_record, spf_exists, spf_parsed = get_spf(domain)
+    # === POST-DNS PARALLEL CHECKS ===
+    # Email auth, blacklists, NS/hosting, SOA, and DNSSEC are independent after DNS resolution.
+    # Run them concurrently to overlap I/O wait times.
+
+    def _task_email_auth():
+        """SPF, DKIM, DMARC, MX, BIMI, MTA-STS — all independent DNS queries."""
+        r = {}
+        r['spf_record'], r['spf_exists'], r['spf_parsed'] = get_spf(domain)
+        r['dkim_exists'], r['dkim_selectors'] = check_dkim(domain)
+        dmarc_record, dmarc_exists, dmarc_parsed = get_dmarc(domain)
+        r['dmarc_record'] = dmarc_record
+        r['dmarc_exists'] = dmarc_exists
+        r['dmarc_parsed'] = dmarc_parsed
+        r['mx_exists'], r['mx_records'], r['mx_is_null'] = get_mx(domain)
+        r['bimi_exists'], r['bimi_record'] = get_bimi(domain)
+        r['mta_sts_exists'], r['mta_sts_record'] = get_mta_sts(domain)
+        return r
+
+    def _task_domain_blacklists():
+        return check_domain_blacklists(domain, config['domain_blacklists'])
+
+    def _task_ip_blacklists():
+        return check_ip_blacklists(res.ip_address, config['ip_blacklists'])
+
+    def _task_ns_hosting():
+        """NS records, hosting provider, CDN, subdomain delegation."""
+        r = {}
+        r['ns_records'] = dns_query(domain, 'NS')
+        if not res.is_mail_only_domain and not res.is_no_resolve_domain:
+            hosting_result = check_hosting_provider(
+                domain, res.ip_address,
+                ns_records=r['ns_records'],
+                ptr_record=res.ptr_record,
+                hosting_config=config
+            )
+            r['hosting'] = hosting_result
+            r['is_cdn_hosted'], r['cdn_provider'] = detect_cdn_hosted(hosting_result["asn"])
+        else:
+            r['hosting'] = None
+            r['is_cdn_hosted'] = False
+            r['cdn_provider'] = ""
+        return r
+
+    def _task_soa():
+        return check_soa_freshness(domain)
+
+    def _task_dnssec():
+        return check_dnssec(domain)
+
+    # Launch all independent checks concurrently
+    with ThreadPoolExecutor(max_workers=6) as _dns_pool:
+        _f_email = _dns_pool.submit(_task_email_auth)
+        _f_dbl = _dns_pool.submit(_task_domain_blacklists)
+        _f_ns = _dns_pool.submit(_task_ns_hosting)
+        _f_soa = _dns_pool.submit(_task_soa)
+        _f_dnssec = _dns_pool.submit(_task_dnssec)
+        _f_ibl = None
+        if not res.is_mail_only_domain and not res.is_no_resolve_domain:
+            _f_ibl = _dns_pool.submit(_task_ip_blacklists)
+
+    # --- Apply email auth results ---
+    _ea = _f_email.result()
+    spf_record, spf_exists, spf_parsed = _ea['spf_record'], _ea['spf_exists'], _ea['spf_parsed']
     res.spf_record = spf_record[:500]
     res.spf_exists = spf_exists
     if spf_exists:
@@ -7708,7 +7798,6 @@ def analyze_domain(domain: str, timeout: float = 10.0, check_rdap: bool = True,
         res.spf_includes = ";".join(spf_parsed.get("includes", []))
         res.spf_lookup_count = spf_parsed.get("lookups", 0)
         res.spf_syntax_valid = spf_parsed.get("valid", True)
-        # Check if SPF includes any real external email provider
         KNOWN_SPF_PROVIDERS = [
             '_spf.google.com', 'google.com', 'googlemail.com',
             'spf.protection.outlook.com', 'outlook.com', 'microsoft.com',
@@ -7725,35 +7814,34 @@ def analyze_domain(domain: str, timeout: float = 10.0, check_rdap: bool = True,
             any(provider in inc.lower() for provider in KNOWN_SPF_PROVIDERS)
             for inc in includes_list
         )
-    
-    # DKIM
-    res.dkim_exists, dkim_selectors = check_dkim(domain)
+
+    dkim_selectors = _ea['dkim_selectors']
+    res.dkim_exists = _ea['dkim_exists']
     res.dkim_selectors_found = ";".join(dkim_selectors)
-    
-    # DMARC
-    dmarc_record, dmarc_exists, dmarc_parsed = get_dmarc(domain)
-    res.dmarc_record = dmarc_record[:500]
-    res.dmarc_exists = dmarc_exists
-    if dmarc_exists:
+
+    res.dmarc_record = _ea['dmarc_record'][:500]
+    res.dmarc_exists = _ea['dmarc_exists']
+    dmarc_parsed = _ea['dmarc_parsed']
+    if _ea['dmarc_exists']:
         res.dmarc_policy = dmarc_parsed.get("policy", "")
         res.dmarc_pct = dmarc_parsed.get("pct", 100)
         res.dmarc_rua = dmarc_parsed.get("rua", "")
-    
-    # MX
-    res.mx_exists, mx_records, res.mx_is_null = get_mx(domain)
+
+    mx_records = _ea['mx_records']
+    res.mx_exists = _ea['mx_exists']
+    res.mx_is_null = _ea['mx_is_null']
     if mx_records:
         res.mx_records = ";".join([f"{p}:{h}" for p, h in mx_records])
         res.mx_primary = mx_records[0][1] if mx_records else ""
         free_mx = ['google.com', 'googlemail.com', 'yahoodns', 'outlook.com']
         res.mx_uses_free_provider = any(f in res.mx_primary.lower() for f in free_mx)
         res.mx_provider_type = classify_mx_provider(mx_records, domain, config)
-        # Detect mail.{domain} template fingerprint — common in phishing infrastructure
         domain_lower = domain.lower()
         res.mx_is_mail_prefix = any(
             h.lower() == f"mail.{domain_lower}" for _, h in mx_records
         )
-    
-    # v7.3.1: MX hijack fingerprint — detect enterprise provider ghosts in DNS
+
+    # MX hijack detection (needs SPF + DKIM + MX results)
     spf_inc_list = spf_parsed.get("includes", []) if spf_exists else []
     mx_hijack = detect_mx_provider_mismatch(
         spf_includes=spf_inc_list,
@@ -7768,46 +7856,38 @@ def analyze_domain(domain: str, timeout: float = 10.0, check_rdap: bool = True,
         res.mx_ghost_provider = mx_hijack["ghost_provider"]
         res.mx_ghost_evidence = ";".join(mx_hijack["evidence"])
         res.mx_hijack_confidence = mx_hijack["confidence"]
-    
-    # BIMI
-    res.bimi_exists, res.bimi_record = get_bimi(domain)
-    
-    # MTA-STS
-    res.mta_sts_exists, res.mta_sts_record = get_mta_sts(domain)
-    
-    # Blacklists (v6.2: now tracks inconclusive checks)
-    bl_hits, bl_count, bl_inconclusive = check_domain_blacklists(domain, config['domain_blacklists'])
+
+    res.bimi_exists, res.bimi_record = _ea['bimi_exists'], _ea['bimi_record']
+    res.mta_sts_exists, res.mta_sts_record = _ea['mta_sts_exists'], _ea['mta_sts_record']
+
+    # --- Apply domain blacklist results ---
+    bl_hits, bl_count, bl_inconclusive = _f_dbl.result()
     res.domain_blacklists_hit = ";".join(bl_hits)
     res.domain_blacklist_count = bl_count
     res.domain_blacklist_inconclusive = bl_inconclusive
-    
-    # IP blacklists and hosting detection require an IP address — skip for mail-only and no-resolve domains
-    if not res.is_mail_only_domain and not res.is_no_resolve_domain:
-        ip_bl_hits, ip_bl_count, ip_bl_inconclusive = check_ip_blacklists(res.ip_address, config['ip_blacklists'])
+
+    # --- Apply IP blacklist results ---
+    if _f_ibl is not None:
+        ip_bl_hits, ip_bl_count, ip_bl_inconclusive = _f_ibl.result()
         res.ip_blacklists_hit = ";".join(ip_bl_hits)
         res.ip_blacklist_count = ip_bl_count
         res.ip_blacklist_inconclusive = ip_bl_inconclusive
 
-    # Hosting Provider Detection
-    ns_records = dns_query(domain, 'NS')
-    if not res.is_mail_only_domain and not res.is_no_resolve_domain:
-        hosting_result = check_hosting_provider(
-            domain, res.ip_address,
-            ns_records=ns_records,
-            ptr_record=res.ptr_record,
-            hosting_config=config
-        )
+    # --- Apply NS/hosting results ---
+    _ns_r = _f_ns.result()
+    ns_records = _ns_r['ns_records']
+    if _ns_r['hosting']:
+        hosting_result = _ns_r['hosting']
         res.hosting_provider = hosting_result["provider"]
         res.hosting_provider_type = hosting_result["provider_type"]
         res.hosting_detected_via = hosting_result["detected_via"]
         res.hosting_asn = hosting_result["asn"]
         res.hosting_asn_org = hosting_result["asn_org"]
-    
-    # v7.3.1: CDN Provider Detection (requires IP/ASN — skip for mail-only and no-resolve)
     if not res.is_mail_only_domain and not res.is_no_resolve_domain:
-        res.is_cdn_hosted, res.cdn_provider = detect_cdn_hosted(res.hosting_asn)
+        res.is_cdn_hosted = _ns_r['is_cdn_hosted']
+        res.cdn_provider = _ns_r['cdn_provider']
 
-    # v7.3.1: Subdomain Delegation Abuse Detection (requires IP — skip for mail-only and no-resolve)
+    # Subdomain delegation abuse (needs hosting results applied above)
     if not res.is_mail_only_domain and not res.is_no_resolve_domain:
         sub_result = detect_subdomain_delegation_abuse(
             submitted_domain=domain,
@@ -7826,14 +7906,8 @@ def analyze_domain(domain: str, timeout: float = 10.0, check_rdap: bool = True,
             res.subdomain_infra_divergent = True
             res.subdomain_divergence_evidence = ";".join(sub_result["evidence"])
             res.subdomain_divergence_confidence = sub_result["confidence"]
-    
+
     # === STAGING / SDLC SUBDOMAIN DETECTION ===
-    # Prefixes that unambiguously indicate a non-production environment:
-    # stg/staging, dev/development, test/testing, uat, qa, sandbox, preview, demo, preprod.
-    # These subdomains are expected to diverge from parent IP/ASN (different hosting),
-    # have no email authentication (staging envs don't send email), and may have
-    # placeholder content.  Scoring those signals as risk on a staging domain creates
-    # FPs for every legitimate SaaS/enterprise that uses environment-specific subdomains.
     _STAGING_PREFIXES = {
         "stg", "staging", "stage",
         "dev", "develop", "development",
@@ -7847,12 +7921,11 @@ def analyze_domain(domain: str, timeout: float = 10.0, check_rdap: bool = True,
     }
     if res.is_subdomain and res.parent_domain:
         _subdomain_label = domain.lower().rstrip('.')
-        # Remove parent suffix to get the leftmost label(s): stg.emersonhealth.com.br → stg
         _sub_prefix = _subdomain_label[:_subdomain_label.rfind('.' + res.parent_domain)].split('.')[0]
         if _sub_prefix in _STAGING_PREFIXES:
             res.is_staging_subdomain = True
-    
-    # Nameserver Risk Detection
+
+    # --- Apply NS risk results ---
     ns_risk_config = config.get("ns_risk_patterns", {})
     ns_risk = check_ns_risk(ns_records, ns_risk_config)
     res.ns_records = ";".join(ns_records)
@@ -7868,20 +7941,51 @@ def analyze_domain(domain: str, timeout: float = 10.0, check_rdap: bool = True,
     res.ns_is_enterprise = ns_risk["is_enterprise_ns"]
     res.ns_enterprise_match = ns_risk.get("enterprise_ns_match", "")
 
-    # v8.1: SOA freshness check (DNS-only, runs for all domains)
-    soa = check_soa_freshness(domain)
+    # --- Apply SOA results ---
+    soa = _f_soa.result()
     res.soa_exists = soa["soa_exists"]
     res.soa_serial = soa["soa_serial"]
     res.soa_serial_is_date = soa["soa_serial_is_date"]
     res.soa_serial_date = soa["soa_serial_date"]
     res.soa_days_since_serial = soa["soa_days_since_serial"]
 
-    # v8.1: DNSSEC check (DNS-only, runs for all domains)
-    res.dnssec_enabled = check_dnssec(domain)
+    # --- Apply DNSSEC result ---
+    res.dnssec_enabled = _f_dnssec.result()
+
+    # === LAUNCH THREAT INTEL + CT FUTURES (run alongside web checks) ===
+    # VirusTotal, Google Safe Browsing, URLhaus, PhishTank, AbuseIPDB, and CT log
+    # lookups are all API/DNS-based — independent of page content.
+    # Start them now so they overlap with the content fetch block.
+    vt_api_key = src.get('vt_api_key', '') or os.environ.get('VT_API_KEY', '')
+    gsb_api_key = src.get('gsb_api_key', '') or os.environ.get('GSB_API_KEY', '')
+    phishtank_api_key = src.get('phishtank_api_key', '') or os.environ.get('PHISHTANK_API_KEY', '')
+    abuseipdb_api_key = src.get('abuseipdb_api_key', '') or os.environ.get('ABUSEIPDB_API_KEY', '')
+
+    _ti_pool = ThreadPoolExecutor(max_workers=6)
+    _f_vt = None
+    _f_ct = None
+    _f_gsb = None
+    _f_urlhaus = None
+    _f_phishtank = None
+    _f_abuseipdb = None
+
+    if VT_CHECKER_AVAILABLE and vt_api_key:
+        def _task_vt():
+            vt = VirusTotalChecker(api_key=vt_api_key)
+            return vt.check_domain(domain)
+        _f_vt = _ti_pool.submit(_task_vt)
+    _f_ct = _ti_pool.submit(check_cert_transparency, domain, timeout=min(timeout, 8.0))
+
+    if THREAT_INTEL_AVAILABLE:
+        if gsb_api_key:
+            _f_gsb = _ti_pool.submit(check_google_safebrowsing, domain, gsb_api_key, 5.0)
+        _f_urlhaus = _ti_pool.submit(check_urlhaus, domain, 5.0)
+        _f_phishtank = _ti_pool.submit(check_phishtank, domain, phishtank_api_key, 5.0)
+        if abuseipdb_api_key and res.ip_address:
+            _f_abuseipdb = _ti_pool.submit(check_abuseipdb, res.ip_address, abuseipdb_api_key, 5.0)
 
     # === WEB CHECKS (TLS, HTTP, content, hacklink, etc.) ===
     # Mail-only and no-resolve domains have no A record / website — skip all web-dependent checks.
-    # DNS-only checks (VT, RDAP/WHOIS) run separately after this block.
     content = None  # Initialize for mail-only/no-resolve path (used by later sections)
     if not res.is_mail_only_domain and not res.is_no_resolve_domain:
         # TLS — v4.4: now captures handshake_failed and connection_failed separately
@@ -8134,26 +8238,7 @@ def analyze_domain(domain: str, timeout: float = 10.0, check_rdap: bool = True,
             # Surface error in results so it's visible during debugging
             res.tld_variant_summary = f"CHECK ERROR: {type(e).__name__}: {str(e)[:200]}"
         
-        # === VIRUSTOTAL REPUTATION CHECK ===
-        # Uses the VT API to check domain reputation across 70+ security vendors
-        vt_api_key = src.get('vt_api_key', '') or os.environ.get('VT_API_KEY', '')
-        if VT_CHECKER_AVAILABLE and vt_api_key:
-            try:
-                vt = VirusTotalChecker(api_key=vt_api_key)
-                vt_result = vt.check_domain(domain)
-                res.vt_available = vt_result.get("vt_available", False)
-                res.vt_malicious_count = vt_result.get("malicious_count", 0)
-                res.vt_suspicious_count = vt_result.get("suspicious_count", 0)
-                res.vt_total_vendors = vt_result.get("total_vendors", 0)
-                res.vt_detection_rate = vt_result.get("detection_rate", 0.0)
-                res.vt_community_score = vt_result.get("community_score", 0)
-                res.vt_reputation = vt_result.get("reputation", 0)
-                res.vt_threat_names = ";".join(vt_result.get("threat_names", []))
-                res.vt_malicious_vendors = ";".join(vt_result.get("malicious_vendors", []))
-                res.vt_categories = json.dumps(vt_result.get("categories", {}))
-                res.vt_last_analysis = vt_result.get("last_analysis_date", "") or ""
-            except Exception:
-                pass  # Non-critical — don't break analysis if VT check fails
+        # (VirusTotal runs as a background future — collected after web checks block)
         
         # === HACKLINK / SEO SPAM DETECTION ===
         # Scans page content for Turkish hacklink injection, gambling keywords, 
@@ -8330,60 +8415,109 @@ def analyze_domain(domain: str, timeout: float = 10.0, check_rdap: bool = True,
         except Exception:
             pass  # Non-critical — never break analysis for OSINT lookup failure
     
-    # === VIRUSTOTAL FOR MAIL-ONLY AND NO-RESOLVE DOMAINS ===
-    # VT is DNS-based (no HTTP needed) — run it for mail-only and no-resolve domains too
-    if res.is_mail_only_domain or res.is_no_resolve_domain:
-        vt_api_key = src.get('vt_api_key', '') or os.environ.get('VT_API_KEY', '')
-        if VT_CHECKER_AVAILABLE and vt_api_key:
-            try:
-                vt = VirusTotalChecker(api_key=vt_api_key)
-                vt_result = vt.check_domain(domain)
-                res.vt_available = vt_result.get("vt_available", False)
-                res.vt_malicious_count = vt_result.get("malicious_count", 0)
-                res.vt_suspicious_count = vt_result.get("suspicious_count", 0)
-                res.vt_total_vendors = vt_result.get("total_vendors", 0)
-                res.vt_detection_rate = vt_result.get("detection_rate", 0.0)
-                res.vt_community_score = vt_result.get("community_score", 0)
-                res.vt_reputation = vt_result.get("reputation", 0)
-                res.vt_threat_names = ";".join(vt_result.get("threat_names", []))
-                res.vt_malicious_vendors = ";".join(vt_result.get("malicious_vendors", []))
-                res.vt_categories = json.dumps(vt_result.get("categories", {}))
-                res.vt_last_analysis = vt_result.get("last_analysis_date", "") or ""
-            except Exception:
-                pass
+    # === COLLECT THREAT INTEL + CT FUTURES (launched before web checks block) ===
+    _ti_pool.shutdown(wait=True)
 
-    # RDAP
+    # Apply VirusTotal results (runs for ALL domain types — resolved, mail-only, no-resolve)
+    if _f_vt is not None:
+        try:
+            vt_result = _f_vt.result()
+            res.vt_available = vt_result.get("vt_available", False)
+            res.vt_malicious_count = vt_result.get("malicious_count", 0)
+            res.vt_suspicious_count = vt_result.get("suspicious_count", 0)
+            res.vt_total_vendors = vt_result.get("total_vendors", 0)
+            res.vt_detection_rate = vt_result.get("detection_rate", 0.0)
+            res.vt_community_score = vt_result.get("community_score", 0)
+            res.vt_reputation = vt_result.get("reputation", 0)
+            res.vt_threat_names = ";".join(vt_result.get("threat_names", []))
+            res.vt_malicious_vendors = ";".join(vt_result.get("malicious_vendors", []))
+            res.vt_categories = json.dumps(vt_result.get("categories", {}))
+            res.vt_last_analysis = vt_result.get("last_analysis_date", "") or ""
+        except Exception:
+            pass  # Non-critical
+
+    # Apply Google Safe Browsing results
+    if _f_gsb is not None:
+        try:
+            gsb = _f_gsb.result()
+            res.gsb_available = gsb.get("available", False)
+            res.gsb_listed = gsb.get("listed", False)
+            res.gsb_threat_types = ";".join(gsb.get("threat_types", []))
+        except Exception:
+            pass
+
+    # Apply URLhaus results
+    if _f_urlhaus is not None:
+        try:
+            uh = _f_urlhaus.result()
+            res.urlhaus_available = uh.get("available", False)
+            res.urlhaus_listed = uh.get("listed", False)
+            res.urlhaus_url_count = uh.get("url_count", 0)
+            res.urlhaus_urls_online = uh.get("urls_online", 0)
+            res.urlhaus_tags = ";".join(uh.get("tags", []))
+        except Exception:
+            pass
+
+    # Apply PhishTank results
+    if _f_phishtank is not None:
+        try:
+            pt = _f_phishtank.result()
+            res.phishtank_available = pt.get("available", False)
+            res.phishtank_listed = pt.get("listed", False)
+            res.phishtank_verified = pt.get("verified", False)
+        except Exception:
+            pass
+
+    # Apply AbuseIPDB results
+    if _f_abuseipdb is not None:
+        try:
+            aip = _f_abuseipdb.result()
+            res.abuseipdb_available = aip.get("available", False)
+            res.abuseipdb_score = aip.get("abuse_confidence_score", 0)
+            res.abuseipdb_reports = aip.get("total_reports", 0)
+        except Exception:
+            pass
+
+    # RDAP + WHOIS parallel race — run both simultaneously, prefer RDAP
     if check_rdap:
-        res.rdap_created, res.domain_age_days, _is_rereg, _rereg_date = rdap_lookup(domain, timeout)
-        if res.domain_age_days >= 0:
+        with ThreadPoolExecutor(max_workers=2) as _rdap_pool:
+            _rdap_future = _rdap_pool.submit(rdap_lookup, domain, timeout)
+            _whois_future = _rdap_pool.submit(whois_lookup, domain)
+            try:
+                _rdap_result = _rdap_future.result()
+            except Exception:
+                _rdap_result = ("", -1, False, "")
+            try:
+                _whois_result = _whois_future.result()
+            except Exception:
+                _whois_result = ("", -1)
+
+        # Prefer RDAP if it returned a valid age
+        if _rdap_result[1] >= 0:
+            res.rdap_created, res.domain_age_days, _is_rereg, _rereg_date = _rdap_result
             res.domain_age_source = "rdap"
-        if _is_rereg:
-            res.domain_reregistered = True
-            res.domain_reregistered_date = _rereg_date
-            if _rereg_date:
-                try:
-                    _rd = datetime.fromisoformat(_rereg_date)
-                    res.domain_reregistered_days = (datetime.now(timezone.utc) - _rd).days
-                except Exception:
-                    pass
-    
-    # WHOIS fallback if RDAP returned no creation date
-    if check_rdap and res.domain_age_days < 0:
-        res.whois_created, res.domain_age_days = whois_lookup(domain)
-        if res.domain_age_days >= 0:
+            if _is_rereg:
+                res.domain_reregistered = True
+                res.domain_reregistered_date = _rereg_date
+                if _rereg_date:
+                    try:
+                        _rd = datetime.fromisoformat(_rereg_date)
+                        res.domain_reregistered_days = (datetime.now(timezone.utc) - _rd).days
+                    except Exception:
+                        pass
+        elif _whois_result[1] >= 0:
+            res.whois_created, res.domain_age_days = _whois_result
             res.domain_age_source = "whois"
-    
-    # v7.5.1: Direct socket WHOIS fallback for TLDs not covered by RDAP/python-whois
-    # (e.g., .ng, .ke, .gh, .pk — many African and Asian ccTLDs)
+
+    # Socket WHOIS fallback — only if both RDAP and python-whois failed
     if check_rdap and res.domain_age_days < 0:
         _sock_created, _sock_age = whois_socket_lookup(domain)
         if _sock_age >= 0:
             res.domain_age_days = _sock_age
             res.whois_created = _sock_created
             res.domain_age_source = "whois_socket"
-    
-    # v7.5.1: HTTP WHOIS fallback — queries web-based WHOIS services over HTTPS.
-    # This is the final fallback when port 43 is blocked (e.g., Streamlit Cloud).
+
+    # HTTP WHOIS fallback — final fallback when port 43 is blocked (e.g., Streamlit Cloud)
     if check_rdap and res.domain_age_days < 0:
         _http_created, _http_age = whois_http_lookup(domain, timeout=min(timeout, 8.0))
         if _http_age >= 0:
@@ -8425,9 +8559,9 @@ def analyze_domain(domain: str, timeout: float = 10.0, check_rdap: bool = True,
         except Exception:
             pass
     
-    # === CERTIFICATE TRANSPARENCY LOG CHECK ===
+    # === CERTIFICATE TRANSPARENCY LOG CHECK (collected from future) ===
     try:
-        ct = check_cert_transparency(domain, timeout=min(timeout, 8.0))
+        ct = _f_ct.result()
         res.ct_log_count = ct["ct_count"]
         res.ct_recent_issuance = ct["recent_issuance"]
         res.ct_issuers = ";".join(ct["issuers"])
