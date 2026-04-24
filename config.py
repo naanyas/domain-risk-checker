@@ -226,6 +226,14 @@ DEFAULT_CONFIG = {
         "hosting_suspect": 20,        # Known bulletproof / abuse-tolerant hosts
         "hosting_platform": 8,         # v7.3: Dev platforms (Render, Netlify, Vercel) — mild signal; these are mainstream enterprise platforms
         
+        # === SUBDOMAIN DELEGATION ABUSE (v7.3.1) ===
+        # Attacker gains DNS access to an aged legit domain and creates a subdomain
+        # pointing to their own infrastructure. The parent passes all trust checks.
+        # HIGH alone is now enough to DENY — strong indicator of DNS compromise.
+        "subdomain_delegation_high": 55,    # Complete IP+ASN+MX divergence from parent — deny-level
+        "subdomain_delegation_medium": 12,  # Partial infra mismatch — combo fuel
+        "subdomain_delegation_low": 0,      # Minor difference — informational only
+
         # === NAMESERVER RISK SIGNALS ===
         "ns_parking": 15,             # Domain delegated to parking/placeholder NS (sedoparking, bodis, etc.)
         "ns_dynamic_dns": 25,         # Domain delegated to dynamic DNS provider (noip, dyndns, etc.)
@@ -521,6 +529,13 @@ DEFAULT_CONFIG = {
         {"name": "combo_ns_lame_no_mx", "score": 15, "label": "lame delegation + no MX", "category": "Nameserver Risk", "enabled": True, "if_all": ["ns_lame_delegation", "no_mx"], "if_any": [], "if_not": []},
         {"name": "combo_ns_free_no_dkim", "score": 0, "label": "free DNS NS + no DKIM", "category": "Nameserver Risk", "enabled": True, "if_all": ["ns_free_dns", "no_dkim"], "if_any": [], "if_not": []},
         {"name": "combo_ns_single_new_30d", "score": 8, "label": "single NS + domain <30d", "category": "Nameserver Risk", "enabled": True, "if_all": ["ns_single_ns", "domain_lt_30d"], "if_any": [], "if_not": []},
+
+        # --- Subdomain Delegation Abuse (compromise pattern combos) ---
+        # HIGH divergence already DENYs alone at weight 55, but these combos escalate
+        # MEDIUM divergence into deny territory when corroborating attack signals fire.
+        {"name": "combo_subdom_delegation_med_plus_youth", "score": 30, "label": "subdomain infra divergence (MEDIUM) + domain <30d", "category": "Subdomain Delegation", "enabled": True, "if_all": ["subdomain_delegation_medium", "domain_lt_30d"], "if_any": [], "if_not": []},
+        {"name": "combo_subdom_delegation_med_plus_selfhost_mx", "score": 25, "label": "subdomain infra divergence (MEDIUM) + self-hosted/disposable MX", "category": "Subdomain Delegation", "enabled": True, "if_all": ["subdomain_delegation_medium"], "if_any": ["mx_selfhosted", "mx_disposable", "no_mx"], "if_not": []},
+        {"name": "combo_subdom_delegation_med_plus_cred_form", "score": 25, "label": "subdomain infra divergence (MEDIUM) + credential form", "category": "Subdomain Delegation", "enabled": True, "if_all": ["subdomain_delegation_medium", "credential_form"], "if_any": [], "if_not": []},
 
         # --- Phishing Kit Detection (8 rules) ---
         # Weak kit filenames (login.php, verify.php) are zero-scored alone —
