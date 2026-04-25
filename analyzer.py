@@ -183,6 +183,12 @@ class DomainApprovalResult:
     ip_blacklists_hit: str = ""
     ip_blacklist_count: int = 0
     ip_blacklist_inconclusive: int = 0        # v6.2: queries that timed out / errored
+
+    # === REPUTATION ALLOWLISTS (DNSWL etc.) ===
+    ip_allowlists_hit: str = ""               # Semicolon-sep list of "zone:tier" entries
+    ip_allowlist_count: int = 0               # Count of allowlists that listed the IP
+    ip_allowlist_inconclusive: int = 0        # Count of zones that returned no answer
+    ip_allowlist_best_tier: str = ""          # Highest tier seen ("low" / "medium" / "high")
     
     # === DOMAIN INFO ===
     rdap_created: str = ""
@@ -2298,9 +2304,9 @@ def check_domain_blacklists(domain: str, blacklists: List[str]) -> Tuple[List[st
 def check_ip_blacklists(ip: str, blacklists: List[str]) -> Tuple[List[str], int, int]:
     """
     Check IP against all configured RBL zones.
-    
+
     v6.2: Now returns inconclusive count as third element.
-    
+
     Returns: (hits, hit_count, inconclusive_count)
     """
     if not ip:
@@ -2308,18 +2314,135 @@ def check_ip_blacklists(ip: str, blacklists: List[str]) -> Tuple[List[str], int,
     reversed_ip = '.'.join(reversed(ip.split('.')))
     hits = []
     inconclusive = 0
-    
+
     for bl in blacklists:
         result = check_blacklist(reversed_ip, bl)
         if result is True:
             hits.append(bl)
         elif result is None:
             inconclusive += 1
-        
+
         if bl != blacklists[-1]:
             _time.sleep(DNSBL_INTER_QUERY_DELAY)
-    
+
     return hits, len(hits), inconclusive
+
+
+# ============================================================================
+# Reputation allowlists (DNSWL)
+# ============================================================================
+
+# DNSWL return-code → trust level. The third octet of the A record encodes
+# the trust tier (RFC-style: 127.0.X.Y where X is the category and Y is the
+# trust level). We only care about Y here.
+# Reference: https://www.dnswl.org/?page_id=15
+DNSWL_TRUST_LEVELS = {
+    0: "none",      # listed but no positive trust assertion
+    1: "low",
+    2: "medium",
+    3: "high",
+}
+
+
+def check_allowlist_tier(query: str, zone: str) -> Optional[str]:
+    """
+    Like check_blacklist, but returns the tier rather than a boolean.
+
+    DNSWL and similar allowlists encode the trust level in the last octet of
+    the returned A record (127.0.X.{0,1,2,3}). We resolve, parse the trust
+    level from the response, and return the human-readable tier name.
+
+    Returns:
+        "none" / "low" / "medium" / "high" — listed at the corresponding tier
+        ""                                  — definitively NOT listed
+        None                                — inconclusive (timeout, SERVFAIL)
+    """
+    if not DNS_AVAILABLE:
+        return None
+
+    cache_key = f"allowlist:{query}:{zone}"
+    if cache_key in _dnsbl_cache:
+        cached_result, cached_time = _dnsbl_cache[cache_key]
+        if _time.time() - cached_time < DNSBL_CACHE_TTL:
+            return cached_result
+        else:
+            del _dnsbl_cache[cache_key]
+
+    result: Optional[str] = None
+    for attempt in range(1 + DNSBL_RETRIES):
+        if attempt > 0:
+            _time.sleep(DNSBL_RETRY_DELAY)
+        try:
+            resolver = dns.resolver.Resolver()
+            resolver.timeout = DNSBL_TIMEOUT
+            resolver.lifetime = DNSBL_TIMEOUT
+            answers = resolver.resolve(f"{query}.{zone}", 'A')
+            tier = "none"
+            for rr in answers:
+                addr = rr.to_text() if hasattr(rr, "to_text") else str(rr)
+                octets = addr.strip().split('.')
+                if len(octets) == 4:
+                    try:
+                        last_octet = int(octets[-1])
+                        tier_name = DNSWL_TRUST_LEVELS.get(last_octet, "none")
+                        # Take the highest tier seen across multiple A records
+                        priority = ["none", "low", "medium", "high"]
+                        if priority.index(tier_name) > priority.index(tier):
+                            tier = tier_name
+                    except ValueError:
+                        continue
+            result = tier
+            break
+        except dns.resolver.NXDOMAIN:
+            result = ""  # definitively not listed
+            break
+        except dns.resolver.NoAnswer:
+            result = ""
+            break
+        except dns.resolver.NoNameservers:
+            continue
+        except dns.exception.Timeout:
+            continue
+        except Exception:
+            continue
+
+    _dnsbl_cache[cache_key] = (result, _time.time())
+    return result
+
+
+def check_ip_allowlists(ip: str, allowlists: List[str]) -> Tuple[List[Tuple[str, str]], str, int]:
+    """
+    Check IP against configured allowlist zones (DNSWL etc.).
+
+    Returns:
+        (hits, best_tier, inconclusive_count)
+        hits         — list of (zone, tier) tuples for every zone that listed the IP
+        best_tier    — highest trust tier seen across all zones ("" if none)
+        inconclusive — number of zones that returned no definitive answer
+    """
+    if not ip or not allowlists:
+        return [], "", 0
+    reversed_ip = '.'.join(reversed(ip.split('.')))
+    hits: List[Tuple[str, str]] = []
+    inconclusive = 0
+    best_tier = ""
+    priority = ["none", "low", "medium", "high"]
+
+    for zone in allowlists:
+        tier = check_allowlist_tier(reversed_ip, zone)
+        if tier is None:
+            inconclusive += 1
+        elif tier == "":
+            pass  # not listed
+        else:
+            hits.append((zone, tier))
+            if priority.index(tier) > priority.index(best_tier or "none"):
+                best_tier = tier
+
+        if zone != allowlists[-1]:
+            _time.sleep(DNSBL_INTER_QUERY_DELAY)
+
+    return hits, best_tier, inconclusive
 
 
 # ============================================================================
@@ -5731,6 +5854,19 @@ def generate_summary(res: DomainApprovalResult, signals: Set[str], rdap_enabled:
                 "records but DNSSEC is not enabled on the parent zone — receiving MTAs cannot "
                 "validate the chain of trust, so DANE has no security value here"
             )
+
+    # DNSWL allowlist (reputation legitimacy signal)
+    if res.ip_allowlist_best_tier in ("low", "medium", "high"):
+        # Format zone names compactly: "list.dnswl.org:high" → "DNSWL (high trust)"
+        zones = res.ip_allowlists_hit.replace(";", ", ")
+        positives.append(
+            f"DNSWL allowlist — {res.ip_allowlist_best_tier} trust ({zones})"
+        )
+    elif res.ip_allowlist_best_tier == "none":
+        # Listed but no trust assertion — note for context
+        positives.append(
+            f"DNSWL listed (no trust tier — operator self-registered without assertion)"
+        )
     
     # v7.5.1: Security tooling positive
     if res.content_security_signals:
@@ -6538,6 +6674,19 @@ def calculate_score(res: DomainApprovalResult, config: dict) -> None:
     # crediting orphan TLSA records that no resolver can validate.
     if res.has_dane and res.dnssec_enabled:
         add("has_dane", weights.get('has_dane', -8))
+
+    # === DNSWL ALLOWLIST BONUS (reputation legitimacy signal) ===
+    # DNSWL is a curated allowlist of known-good senders. Tier reflects how
+    # strongly DNSWL operators trust the source. Bonuses are modest and
+    # tier-scaled so a "high" listing materially helps but doesn't whitewash
+    # other risk signals.
+    if res.ip_allowlist_best_tier == "high":
+        add("dnswl_listed_high", weights.get('dnswl_listed_high', -15))
+    elif res.ip_allowlist_best_tier == "medium":
+        add("dnswl_listed_medium", weights.get('dnswl_listed_medium', -8))
+    elif res.ip_allowlist_best_tier == "low":
+        add("dnswl_listed_low", weights.get('dnswl_listed_low', -3))
+    # Tier "none" means listed but with no positive trust assertion — no bonus.
 
     # === SECURITY TOOLING TRUST BONUS (v7.5.1) ===
     # Legitimate sites invest in bot management, CAPTCHA, and security tooling.
@@ -7953,6 +8102,9 @@ def analyze_domain(domain: str, timeout: float = 10.0, check_rdap: bool = True,
     def _task_ip_blacklists():
         return check_ip_blacklists(res.ip_address, config['ip_blacklists'])
 
+    def _task_ip_allowlists():
+        return check_ip_allowlists(res.ip_address, config.get('ip_allowlists', []))
+
     def _task_ns_hosting():
         """NS records, hosting provider, CDN, subdomain delegation."""
         r = {}
@@ -7979,15 +8131,17 @@ def analyze_domain(domain: str, timeout: float = 10.0, check_rdap: bool = True,
         return check_dnssec(domain)
 
     # Launch all independent checks concurrently
-    with ThreadPoolExecutor(max_workers=6) as _dns_pool:
+    with ThreadPoolExecutor(max_workers=7) as _dns_pool:
         _f_email = _dns_pool.submit(_task_email_auth)
         _f_dbl = _dns_pool.submit(_task_domain_blacklists)
         _f_ns = _dns_pool.submit(_task_ns_hosting)
         _f_soa = _dns_pool.submit(_task_soa)
         _f_dnssec = _dns_pool.submit(_task_dnssec)
         _f_ibl = None
+        _f_ial = None
         if not res.is_mail_only_domain and not res.is_no_resolve_domain:
             _f_ibl = _dns_pool.submit(_task_ip_blacklists)
+            _f_ial = _dns_pool.submit(_task_ip_allowlists)
 
     # --- Apply email auth results ---
     _ea = _f_email.result()
@@ -8122,6 +8276,15 @@ def analyze_domain(domain: str, timeout: float = 10.0, check_rdap: bool = True,
         res.ip_blacklists_hit = ";".join(ip_bl_hits)
         res.ip_blacklist_count = ip_bl_count
         res.ip_blacklist_inconclusive = ip_bl_inconclusive
+
+    # --- Apply IP allowlist results (DNSWL etc.) ---
+    if _f_ial is not None:
+        ip_al_hits, ip_al_best, ip_al_inconclusive = _f_ial.result()
+        # Store as "zone:tier" for transparency
+        res.ip_allowlists_hit = ";".join(f"{zone}:{tier}" for zone, tier in ip_al_hits)
+        res.ip_allowlist_count = len(ip_al_hits)
+        res.ip_allowlist_inconclusive = ip_al_inconclusive
+        res.ip_allowlist_best_tier = ip_al_best
 
     # --- Apply NS/hosting results ---
     _ns_r = _f_ns.result()
