@@ -776,7 +776,92 @@ def display_results(results: list):
                     for item in _suppression_items:
                         st.markdown(item)
                         st.markdown("")
-            
+
+            # === 🎯 THREAT SURFACE — BRAND IMPERSONATION SURVEILLANCE ===
+            # Surfaces lookalike domains, display-name spoofs, webmail
+            # impersonation, and real-domain spoofing. Informational only —
+            # no scoring impact today. Categories that depend on DMARC RUA
+            # ingestion are shown as placeholders so the operator can see
+            # the full picture of what's covered vs not.
+            if domain_data.get('lookalike_checked'):
+                ll_count = int(domain_data.get('lookalike_registered_count', 0) or 0)
+                ll_with_a = int(domain_data.get('lookalike_with_a_count', 0) or 0)
+                ll_with_mx = int(domain_data.get('lookalike_with_mx_count', 0) or 0)
+                ll_checked = int(domain_data.get('lookalike_candidates_checked', 0) or 0)
+
+                st.markdown("### 🎯 Threat Surface")
+                st.caption(
+                    "External impersonation surveillance. Lookalike count is live; the other "
+                    "categories require DMARC aggregate report ingestion (see future iterations)."
+                )
+
+                _surface_rows = [
+                    {
+                        "Threat Type": "Lookalike Domains Registered",
+                        "Count": str(ll_count) if ll_count else "0",
+                        "Status": (
+                            f"✅ Tracked ({ll_checked} permutations checked, "
+                            f"{ll_with_a} with web infra, {ll_with_mx} with MX)"
+                        ),
+                    },
+                    {
+                        "Threat Type": "Display-Name Spoof Reports",
+                        "Count": "—",
+                        "Status": "⏳ Requires DMARC RUA ingestion",
+                    },
+                    {
+                        "Threat Type": "Free Webmail Impersonation",
+                        "Count": "—",
+                        "Status": "⏳ Requires email-enumeration source",
+                    },
+                    {
+                        "Threat Type": "Real Domain Spoofing",
+                        "Count": "—",
+                        "Status": "⏳ Requires DMARC RUA ingestion",
+                    },
+                ]
+                st.table(_surface_rows)
+
+                # --- Drill-down: Registered lookalikes ---
+                ll_raw = domain_data.get('lookalike_registered', '')
+                if ll_raw and ll_count > 0:
+                    try:
+                        ll_list = json.loads(ll_raw)
+                    except (json.JSONDecodeError, TypeError):
+                        ll_list = []
+
+                    if ll_list:
+                        with st.expander(
+                            f"🔎 Registered lookalikes ({ll_count})",
+                            expanded=ll_count <= 10,
+                        ):
+                            st.caption(
+                                "Domains generated from typosquat / homoglyph / "
+                                "brand-impersonation permutations of the analyzed domain "
+                                "that are currently registered. Domains with a live A "
+                                "record or MX records are higher-priority for review."
+                            )
+                            ll_rows = []
+                            for entry in ll_list:
+                                flags = []
+                                if entry.get("has_a"):
+                                    flags.append(f"A → {entry.get('ip', '')}")
+                                if entry.get("has_mx"):
+                                    flags.append(f"MX × {entry.get('mx_count', 0)}")
+                                ll_rows.append({
+                                    "Lookalike": entry.get("candidate", ""),
+                                    "Web (A)": "✅" if entry.get("has_a") else "—",
+                                    "Mail (MX)": "✅" if entry.get("has_mx") else "—",
+                                    "IP / Notes": " · ".join(flags) if flags else "(NS only)",
+                                })
+                            st.dataframe(
+                                pd.DataFrame(ll_rows),
+                                width="stretch",
+                                hide_index=True,
+                            )
+
+                st.markdown("---")
+
             # === ALL ISSUES LIST ===
             all_issues_raw = domain_data.get('all_issues_text', '')
             if all_issues_raw:
