@@ -213,6 +213,9 @@ DEFAULT_CONFIG = {
         "has_mta_sts": -10,
         "has_tls_rpt": -3,                # TLS Reporting (RFC 8460) — pairs with MTA-STS, modest operational-maturity bonus
         "has_dane": -8,                   # DANE/TLSA (RFC 7672) — strong infra-hygiene signal (only credited when DNSSEC is also enabled)
+        "dnswl_listed_high": -15,         # DNSWL high-trust IP — strongest reputation legitimacy signal
+        "dnswl_listed_medium": -8,        # DNSWL medium-trust IP — established sender
+        "dnswl_listed_low": -3,           # DNSWL low-trust IP — listed but minimal trust assertion
         "dev_staging_high": -15,          # v7.5.2: HIGH confidence dev/staging/QA — expected infra patterns, not attacker signals
         
         # === APP STORE PRESENCE BONUSES (Legitimacy signal) ===
@@ -871,12 +874,37 @@ DEFAULT_CONFIG = {
     "domain_blacklists": [
         "dbl.spamhaus.org",
         "multi.surbl.org",
+        "urired.mailspike.net",        # Mailspike URIBL — domain reputation (free)
     ],
-    
+
     "ip_blacklists": [
         "zen.spamhaus.org",
         "b.barracudacentral.org",
         "bl.spamcop.net",
+        "bl.mailspike.net",            # Mailspike IP reputation (free, low FP rate)
+    ],
+
+    # IP allowlists. Listing in any of these is a legitimacy signal — operators
+    # who appear in trusted allowlists have established sending reputation.
+    # Currently only DNSWL, which uses tiered return codes (127.0.X.{0,1,2,3})
+    # to indicate trust level (none/low/medium/high). check_ip_allowlists()
+    # parses the tier from the return value and applies a scaled bonus.
+    #
+    # IMPORTANT (DNSWL access model):
+    # DNSWL blocks queries from public/shared resolvers (8.8.8.8, 1.1.1.1, etc.)
+    # to prevent batch abuse. Two paths to make this query land:
+    #   (a) Run SDAT against a private/local resolver (e.g. self-hosted unbound
+    #       on the same host) — list.dnswl.org responds normally.
+    #   (b) Sign up for free DNSWL+ at https://www.dnswl.org/?page_id=15 and
+    #       prepend the resulting key to the zone:
+    #          "abc123def456.list.dnswl.org"
+    #       This works from any resolver. Replace the entry below with your
+    #       keyed zone in production.
+    # When DNSWL queries are blocked, the check returns empty — no false
+    # negatives, but no bonuses awarded. Consider this when running on
+    # Streamlit Cloud / similar shared infrastructure.
+    "ip_allowlists": [
+        "list.dnswl.org",              # DNSWL allowlist — free, tiered trust
     ],
     
     # ==========================================================================
