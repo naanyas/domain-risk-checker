@@ -14,6 +14,9 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from remediations import REMEDIATIONS, get_remediation, has_remediation
+from dmarc_aggregate import DmarcRollup, top_sources
+from dmarc_remediations import evaluate_rollup, render_no_data
+from dmarc_store import FileSystemDmarcStore
 from io import BytesIO
 
 # Import the analysis engine
@@ -776,6 +779,49 @@ def display_results(results: list):
                     for item in _suppression_items:
                         st.markdown(item)
                         st.markdown("")
+
+            # === 📨 DMARC RUA SUMMARY (analyst signal) ===
+            # If we have DMARC aggregate reports for this domain in our store,
+            # surface a compact summary inline. Full drill-down lives in the
+            # admin DMARC Analyst tab. Skipped silently if there's no data.
+            try:
+                _dmarc_store = _get_dmarc_store()
+                _dmarc_domain = domain_data.get('domain', '')
+                if _dmarc_domain:
+                    _dmarc_count = _dmarc_store.get_recent_report_count(_dmarc_domain, days_back=30)
+                    if _dmarc_count > 0:
+                        _dmarc_rollup = _dmarc_store.get_rollup(_dmarc_domain, days_back=30)
+                        _dmarc_findings = evaluate_rollup(_dmarc_rollup, days_back=30)
+
+                        st.markdown("### 📨 DMARC RUA Summary")
+                        st.caption(
+                            f"Aggregate reports for **{_dmarc_domain}** over the last 30 days. "
+                            "Full drill-down + customer message templates in the Admin → DMARC Analyst tab."
+                        )
+                        _dmarc_cols = st.columns(4)
+                        _dmarc_cols[0].metric("Total messages", f"{_dmarc_rollup.total_messages:,}")
+                        _dmarc_cols[1].metric("Aligned", f"{_dmarc_rollup.aligned_messages:,}")
+                        _dmarc_cols[2].metric(
+                            "Real spoofing",
+                            f"{_dmarc_rollup.real_domain_spoofing:,}",
+                        )
+                        _dmarc_cols[3].metric("Misaligned", f"{_dmarc_rollup.misaligned_messages:,}")
+
+                        if _dmarc_findings:
+                            st.warning(
+                                f"⚠️ **{len(_dmarc_findings)} finding(s) flagged.** "
+                                "See Admin → DMARC Analyst tab for analyst actions and customer message templates."
+                            )
+                            for _f in _dmarc_findings:
+                                st.markdown(
+                                    f"- **{_f['name'].replace('_', ' ').title()}** — "
+                                    f"{_f['what_it_means'].split('.')[0]}."
+                                )
+
+                        st.markdown("---")
+            except Exception:
+                # DMARC store is best-effort — never let it break the main view
+                pass
 
             # === 🎯 THREAT SURFACE — BRAND IMPERSONATION SURVEILLANCE ===
             # Surfaces lookalike domains, display-name spoofs, webmail
@@ -1667,7 +1713,15 @@ def admin_view():
     config = st.session_state.config
     
     # Tabs for different config sections
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["⚖️ Scoring Weights", "📖 Signal Reference", "📐 Rules Engine", "🎯 Thresholds", "📋 Lists", "💾 Import/Export"])
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+        "⚖️ Scoring Weights",
+        "📖 Signal Reference",
+        "📐 Rules Engine",
+        "🎯 Thresholds",
+        "📋 Lists",
+        "💾 Import/Export",
+        "📨 DMARC Analyst",
+    ])
     
     with tab1:
         st.header("⚖️ Scoring Weights")
@@ -2333,7 +2387,10 @@ def admin_view():
             save_config(copy.deepcopy(DEFAULT_CONFIG))
             st.success("Reset to defaults!")
             st.rerun()
-    
+
+    with tab7:
+        _render_dmarc_analyst_dashboard()
+
     # Save button
     st.markdown("---")
     col1, col2, col3 = st.columns([1, 1, 2])
@@ -2342,6 +2399,154 @@ def admin_view():
             save_config(config)
             st.session_state.config = config
             st.success("✅ Configuration saved!")
+
+
+# ============================================================================
+# DMARC ANALYST DASHBOARD
+# ============================================================================
+
+@st.cache_resource
+def _get_dmarc_store() -> FileSystemDmarcStore:
+    """Single shared store handle for the app session."""
+    return FileSystemDmarcStore("data/dmarc")
+
+
+def _render_dmarc_analyst_dashboard() -> None:
+    """
+    Tab body for analysts to:
+      • Manually upload DMARC aggregate reports (until the automated
+        receiver lands)
+      • Pick a customer domain and see the latest rollup with
+        actionable remediation guidance + customer message templates
+    """
+    st.header("📨 DMARC Analyst Dashboard")
+    st.caption(
+        "Per-customer DMARC aggregate report intelligence. Upload reports manually "
+        "to start collecting today; the automated receiver lands in a follow-up PR."
+    )
+
+    store = _get_dmarc_store()
+
+    # ----- Manual upload -----
+    with st.expander("📤 Upload a DMARC aggregate report", expanded=False):
+        st.markdown(
+            "Drop in a `.xml`, `.xml.gz`, or `.zip` file from a customer's DMARC "
+            "`rua=` mailbox. The domain is read from the report itself — you don't "
+            "need to specify it. Multiple uploads from the same domain accumulate."
+        )
+        uploaded = st.file_uploader(
+            "DMARC aggregate report",
+            type=["xml", "gz", "zip"],
+            accept_multiple_files=True,
+            key="dmarc_upload",
+        )
+        upload_source = st.text_input(
+            "Source label (optional)",
+            value="manual-upload",
+            help="Free-text tag stored with each report for audit. e.g. \"acme-2026-04-customer-email\".",
+        )
+        if uploaded and st.button("Ingest uploaded report(s)", type="primary"):
+            results = []
+            for f in uploaded:
+                try:
+                    storage_id = store.add_report(f.read(), source=upload_source)
+                    results.append(("✅", f.name, storage_id))
+                except Exception as exc:
+                    results.append(("❌", f.name, f"parse failed: {exc}"))
+            for emoji, fname, info in results:
+                st.write(f"{emoji} **{fname}** → `{info}`")
+            st.rerun()
+
+    st.markdown("---")
+
+    # ----- Domain picker -----
+    domains = store.list_domains()
+    if not domains:
+        st.info(
+            "No DMARC reports ingested yet. Upload one above, or — once the "
+            "automated receiver is in place — direct customer DMARC `rua=` "
+            "tags to the SDAT inbox."
+        )
+        st.markdown("**To onboard a customer once the receiver is live:**")
+        st.markdown(render_no_data("their-domain.com")["customer_message"])
+        return
+
+    selected_domain = st.selectbox(
+        "Customer domain",
+        domains,
+        help="Pick a domain to see its DMARC rollup and analyst guidance.",
+    )
+
+    days_back = st.slider(
+        "Lookback window (days)",
+        min_value=1, max_value=90, value=7,
+        help="Reports whose time window or ingestion timestamp falls within this window are aggregated.",
+    )
+
+    rollup = store.get_rollup(selected_domain, days_back=days_back)
+    report_count = store.get_recent_report_count(selected_domain, days_back=days_back)
+
+    # ----- Rollup metrics -----
+    st.subheader(f"📊 {selected_domain} — last {days_back} days")
+    if report_count == 0:
+        st.warning(
+            f"No reports for **{selected_domain}** in the last {days_back} days. "
+            "Try widening the lookback window or check that reports are being ingested."
+        )
+        no_data = render_no_data(selected_domain)
+        with st.expander("📋 Customer onboarding message", expanded=True):
+            st.markdown(no_data["customer_message"])
+        return
+
+    cols = st.columns(4)
+    cols[0].metric("Reports ingested", f"{report_count}")
+    cols[1].metric("Total messages", f"{rollup.total_messages:,}")
+    cols[2].metric("Aligned (legitimate)", f"{rollup.aligned_messages:,}")
+    cols[3].metric(
+        "Real domain spoofing",
+        f"{rollup.real_domain_spoofing:,}",
+        delta=(
+            f"{rollup.quarantined:,} quarantined / {rollup.rejected:,} rejected"
+            if (rollup.quarantined or rollup.rejected) else None
+        ),
+        delta_color="off",
+    )
+
+    cols2 = st.columns(4)
+    cols2[0].metric("Misaligned", f"{rollup.misaligned_messages:,}")
+    cols2[1].metric("Reporting orgs", f"{len(rollup.reporting_orgs)}")
+    cols2[2].metric("Unique sources", f"{len(rollup.sources)}")
+
+    # ----- Top sources -----
+    if rollup.sources:
+        with st.expander("🌐 Top source IPs", expanded=False):
+            sources_df = pd.DataFrame(top_sources(rollup, limit=15))
+            sources_df.columns = ["Source IP", "Message count"]
+            st.dataframe(sources_df, width="stretch", hide_index=True)
+
+    # ----- Reporting receivers -----
+    if rollup.reporting_orgs:
+        with st.expander(f"📬 Reporting receivers ({len(rollup.reporting_orgs)})", expanded=False):
+            st.write(", ".join(rollup.reporting_orgs))
+
+    # ----- Findings + remediation -----
+    findings = evaluate_rollup(rollup, days_back=days_back)
+    st.markdown("---")
+    if not findings:
+        st.success(
+            "✅ **No flagged findings.** DMARC reports look healthy for the lookback window. "
+            "Continue monitoring."
+        )
+    else:
+        st.subheader(f"🛠️ Findings & analyst guidance ({len(findings)})")
+        for finding in findings:
+            with st.expander(f"**{finding['name'].replace('_', ' ').title()}**", expanded=True):
+                st.markdown("**What it means:**")
+                st.markdown(finding["what_it_means"])
+                st.markdown("**Analyst actions:**")
+                st.markdown(finding["analyst_actions"])
+                with st.expander("📋 Customer message template (copy-pasteable)"):
+                    st.code(finding["customer_message"], language="markdown")
 
 
 def main():

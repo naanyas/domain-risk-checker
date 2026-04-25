@@ -1,6 +1,6 @@
 # DMARC RUA Ingestion — Design
 
-**Status:** Draft (foundation landed; ingestion path TBD)
+**Status:** Foundation + analyst MVP landed (manual ingestion). Automated receiver is the next follow-up.
 **Owners:** Jenna Webb, Andy King
 **Last updated:** 2026-04-25
 
@@ -119,36 +119,81 @@ Postmark, *then* invest in Path B.
 5. **Aggregation window?** Last 24h, 7d, 30d? Default 7d feels right —
    long enough for stable trends, short enough to be actionable.
 
-## What's in this PR (foundation only)
+## Decided architecture (2026-04-25)
 
-- `dmarc_aggregate.py` — pure-Python parser for RUA aggregate reports
-  - Accepts raw bytes (gzip / zip / plain XML auto-detected)
-  - Returns `DmarcAggregate` (per-report) and `DmarcRecord` (per-row) dataclasses
-  - `rollup_records()` aggregates records by source IP / disposition
-- `tests/test_dmarc_aggregate.py` — fixture-based round-trip test
-- This design doc
+After product discussion, the chosen approach is **vendor-aggregated
+with analyst-facing UI**:
 
-The parser is consumer-agnostic: whether ingestion comes from Path A
-or Path B, the same struct ends up surfaced in the UI.
+- **OneSignal centrally ingests** DMARC reports for any customer who
+  points their `rua=` at an OneSignal-controlled mailbox / endpoint.
+- **Storage is per-domain** — each customer's reports are scoped to
+  their own domain. No cross-customer aggregation in the analyst UI.
+- **Analyst-facing surfacing** — the data lives behind the admin
+  password; analysts pull up a customer domain, see the rollup, and
+  get prescriptive guidance for next-step recommendations.
+- **Customer-actionable output** — every flagged finding ships with
+  both an *analyst action checklist* and a *copy-pasteable customer
+  message template* so the analyst can communicate the next step
+  without composing one from scratch.
+- **Path B will follow** — the long-term receiver is SES → S3 →
+  Lambda. Until that lands, analysts can manually upload reports
+  via the admin UI to start collecting data immediately.
 
-## What's *not* in this PR
+## What's in this PR (analyst MVP)
 
-- No ingestion path (no SMTP server, no Postmark API client, no S3 receiver)
-- No storage layer (rollups are computed in-memory per analysis)
-- No UI changes — Threat Surface placeholders stay as-is until ingestion
-  is decided
-- No DomainApprovalResult fields yet — added in a follow-up after the
-  ingestion path is chosen
+- `dmarc_aggregate.py` — parser foundation (already in main from PR #6)
+- `dmarc_store.py` — storage abstraction (`DmarcStore` protocol +
+  `FileSystemDmarcStore` filesystem-backed implementation, JSON-on-disk,
+  one file per ingested report). Designed so swapping the backend to
+  SQLite / Postgres / S3 is a one-class change with zero consumer impact.
+- `dmarc_remediations.py` — analyst-facing remediation registry. Each
+  entry has `what_it_means` (impact assessment), `analyst_actions`
+  (numbered checklist), and `customer_message` (template). `evaluate_rollup()`
+  fires the entries whose detection rules match. Six entries cover:
+  no_data, low/high spoofing volume, p=none with spoofing, misaligned
+  legitimate sources, dominant source concentration.
+- **Admin tab "📨 DMARC Analyst"** — manual upload form, domain picker,
+  rollup metrics, top sources, reporting receivers, findings list with
+  expanders, customer message templates ready to paste.
+- **Inline summary in the per-domain analysis view** — when an analyst
+  runs a normal domain analysis, if we have DMARC data for that domain
+  a compact summary appears with a flagged-findings counter and a
+  pointer to the full Analyst tab.
+- 13 new tests in `tests/test_dmarc_store.py` covering store
+  round-trips, multi-report aggregation, lookback windows, and every
+  detection rule in the remediation evaluator.
 
-## Follow-up PRs (in suggested order)
+## What's *still not* in this PR
 
-1. **DMARC processor client** (Path A) — Postmark Digests API client,
-   surfaces stats in Threat Surface UI. Replaces 2 of 3 placeholders.
-2. **Customer-managed RUA token** — generate a unique `rua=mailto:` per
-   customer if we go Path B, plus a configuration UI for the customer
-   to update their DMARC record.
-3. **SES → S3 → Lambda receiver** (Path B) — only if processor coverage
-   isn't enough.
-4. **Free webmail impersonation surveillance** — separate enumeration
-   source (HIBP-style, or Google Postmaster Tools), populates the third
-   placeholder row.
+These are the next concrete follow-ups, in suggested order:
+
+1. **Automated receiver (SES → S3 → Lambda)** — replace manual upload.
+   Receives DMARC aggregate emails at a single mailbox
+   (`dmarc@onesignal.com` or per-customer tokens), writes to S3, Lambda
+   parses + writes to the DmarcStore. Requires AWS infra setup.
+2. **Per-customer `rua=` tokens** — if we want to disambiguate which
+   customer a report is for without relying solely on the report's
+   internal domain field, generate `dmarc-{customer-id}@onesignal.com`
+   addresses. Useful when the same domain is owned by multiple
+   customers (rare) or when we want to track ingest auth.
+3. **DmarcStore Postgres backend** — the filesystem store is fine for
+   small footprint and dev, but for production with many customers
+   we'll want indexed queries and retention policies.
+4. **Wire findings into Threat Surface table** — the lookalike
+   surveillance UI has placeholder rows for "Display-Name Spoof
+   Reports" and "Real Domain Spoofing." When automated ingestion
+   lands, populate those from the rollup directly.
+5. **Free webmail impersonation surveillance** — separate enumeration
+   source for the third Threat Surface placeholder. Out of scope here.
+
+## Open questions (now lower-priority, but worth deciding before #1)
+
+- **Retention?** Reports contain source IPs and recipient counts.
+  Recommend 90 days hot, then anonymize-and-archive. Confirm with
+  legal/privacy.
+- **Per-customer authentication?** The receiver should validate that
+  inbound reports correspond to a known customer domain. Tokens
+  (option 2 above) solve this elegantly.
+- **Notification?** Should the analyst get a Slack message when a new
+  high-severity finding fires for any monitored domain? Currently
+  passive — analyst has to pull up the domain to see findings.
