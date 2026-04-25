@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Streamlit
+.streamlit/
+
+# Persisted runtime config (ships with explicit DEFAULT_CONFIG seed)
+data/config.json
+
+# DMARC report storage — per-customer data, never commit
+data/dmarc/
+
+# Test artifacts
+*.tmp
+.pytest_cache/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
