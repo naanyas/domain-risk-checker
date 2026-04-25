@@ -211,6 +211,8 @@ DEFAULT_CONFIG = {
         # === BONUSES (Reduce score) ===
         "has_bimi": -15,
         "has_mta_sts": -10,
+        "has_tls_rpt": -3,                # TLS Reporting (RFC 8460) — pairs with MTA-STS, modest operational-maturity bonus
+        "has_dane": -8,                   # DANE/TLSA (RFC 7672) — strong infra-hygiene signal (only credited when DNSSEC is also enabled)
         "dev_staging_high": -15,          # v7.5.2: HIGH confidence dev/staging/QA — expected infra patterns, not attacker signals
         
         # === APP STORE PRESENCE BONUSES (Legitimacy signal) ===
