@@ -165,6 +165,17 @@ class DomainApprovalResult:
     dane_total_mx: int = 0                    # Total MX hosts checked
     dane_records_found: str = ""              # Semicolon-sep list of MX hosts with DANE
 
+    # === LOOKALIKE / BRAND IMPERSONATION SURVEILLANCE (informational) ===
+    # Generates plausible typosquats / homoglyphs / brand-impersonation
+    # variants of the analyzed domain and checks which are registered.
+    # Informational only — no scoring impact.
+    lookalike_checked: bool = False           # True if surveillance was attempted
+    lookalike_candidates_checked: int = 0     # Permutations DNS-checked
+    lookalike_registered_count: int = 0       # Lookalike domains found registered
+    lookalike_registered: str = ""            # JSON list of {candidate, has_a, has_mx, ip, mx_count}
+    lookalike_with_a_count: int = 0           # Subset that have an A record (live infra)
+    lookalike_with_mx_count: int = 0          # Subset that have MX records (mail-receiving)
+
     # === BLACKLISTS ===
     domain_blacklists_hit: str = ""
     domain_blacklist_count: int = 0
@@ -8065,6 +8076,38 @@ def analyze_domain(domain: str, timeout: float = 10.0, check_rdap: bool = True,
             res.dane_records_found = ";".join(_dane["mx_hosts"][:5])
         except Exception:
             # DANE lookups can fail in restricted environments — silent fail.
+            pass
+
+    # --- Lookalike / brand-impersonation surveillance (informational) ---
+    # Generate plausible lookalike permutations and check which are registered.
+    # Skipped for subdomains (we surveil the registrable root only) and for
+    # mail-only / no-resolve domains (less likely to be impersonation targets,
+    # and we want to keep analysis time reasonable).
+    if (full_config or {}).get("lookalike_surveillance_enabled", True):
+        try:
+            from lookalike_detector import find_lookalikes
+            registrable_root = get_registrable_domain(domain)
+            if (registrable_root
+                    and registrable_root == domain.lower().rstrip('.')
+                    and not res.is_mail_only_domain
+                    and not res.is_no_resolve_domain):
+                _ll_cfg = (full_config or {}).get("lookalike_surveillance", {})
+                _ll = find_lookalikes(
+                    domain,
+                    max_candidates=_ll_cfg.get("max_candidates", 120),
+                    timeout=_ll_cfg.get("per_lookup_timeout", 1.5),
+                    max_workers=_ll_cfg.get("max_workers", 15),
+                    overall_timeout=_ll_cfg.get("overall_timeout", 20.0),
+                )
+                res.lookalike_checked = True
+                res.lookalike_candidates_checked = _ll["candidates_checked"]
+                res.lookalike_registered_count = _ll["registered_count"]
+                res.lookalike_with_a_count = sum(1 for r in _ll["registered"] if r["has_a"])
+                res.lookalike_with_mx_count = sum(1 for r in _ll["registered"] if r["has_mx"])
+                # Persist as JSON so the UI can render structured details
+                res.lookalike_registered = json.dumps(_ll["registered"])
+        except Exception:
+            # Surveillance is best-effort — never let it break the main analysis.
             pass
 
     # --- Apply domain blacklist results ---
