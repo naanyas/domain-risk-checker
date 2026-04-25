@@ -13,6 +13,7 @@ import os
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from remediations import REMEDIATIONS, get_remediation, has_remediation
 from io import BytesIO
 
 # Import the analysis engine
@@ -638,7 +639,26 @@ def display_results(results: list):
                         prefix = "📐" if is_rule else "⚡"
                         label_text = f" — {label}" if label else ""
                         st.markdown(f"&nbsp;&nbsp;{prefix} `{display_name}` **+{pts}**{label_text}")
-                
+
+                    # === 🛠️ HOW TO FIX (operational guidance) ===
+                    # Show copy-pasteable remediation for any penalty signals
+                    # that have guidance in remediations.py.
+                    fixable_penalties = [
+                        (item, pts) for item, pts in sorted_penalties
+                        if has_remediation(item[5:] if item.startswith("rule:") else item)
+                    ]
+                    if fixable_penalties:
+                        with st.expander(f"🛠️ How to fix ({len(fixable_penalties)} signal{'s' if len(fixable_penalties) != 1 else ''} with guidance)"):
+                            domain_for_fix = domain_data.get('domain', 'your-domain.com')
+                            for item, pts in fixable_penalties:
+                                signal_name = item[5:] if item.startswith("rule:") else item
+                                rem = get_remediation(signal_name, domain=domain_for_fix)
+                                if rem:
+                                    st.markdown(f"#### `{signal_name}` — {rem['title']}")
+                                    st.caption(rem['why'])
+                                    st.markdown(rem['fix'])
+                                    st.divider()
+
                 if sorted_bonuses:
                     st.markdown(f"**🟢 Bonuses** ({total_bonus} pts)")
                     for item, pts in sorted_bonuses:
