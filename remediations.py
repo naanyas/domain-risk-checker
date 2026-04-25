@@ -356,6 +356,38 @@ REMEDIATIONS = {
             "Verify with `dig -x <sending-ip>` and `dig mail.{domain} A`."
         ),
     },
+
+    # ============================================================
+    # Reputation listings
+    # ============================================================
+    "dnswl_not_listed": {
+        "title": "Sender IP not listed in DNSWL",
+        "why": (
+            "DNSWL is a curated allowlist of legitimate senders. Listing — "
+            "especially at medium or high trust tier — improves inbox placement "
+            "with any receiver that consults DNSWL (most major mailbox providers "
+            "do indirectly through their reputation systems). Not being listed "
+            "isn't a problem on its own, but listing is a low-effort, high-value "
+            "win for any high-volume legitimate sender."
+        ),
+        "fix": (
+            "Self-register at [DNSWL Self-Service]"
+            "(https://www.dnswl.org/?page_id=15):\n\n"
+            "1. Create an account and verify your domain ownership\n"
+            "2. Add the sending IPs (or netblocks) you operate\n"
+            "3. Initial listings start at the **none** tier\n"
+            "4. After 60+ days of clean sending behavior, request elevation "
+            "to **low** or **medium** trust\n"
+            "5. **high** trust requires a formal application and 12+ months "
+            "of zero abuse\n\n"
+            "If SDAT runs on shared/cloud DNS (Streamlit Cloud, AWS Lambda, "
+            "etc.) the public DNSWL zone may be blocked. Use a free "
+            "[DNSWL+ API key](https://www.dnswl.org/?page_id=15) and put the "
+            "keyed zone (`<key>.list.dnswl.org`) in `ip_allowlists` so this "
+            "check fires regardless of resolver."
+        ),
+    },
+
     "mx_mail_prefix": {
         "title": "MX uses the `mail.{domain}` template",
         "why": (
