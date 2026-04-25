@@ -152,7 +152,19 @@ class DomainApprovalResult:
     # === EMAIL: MTA-STS ===
     mta_sts_exists: bool = False
     mta_sts_record: str = ""
-    
+
+    # === EMAIL: TLS-RPT (TLS Reporting, RFC 8460) ===
+    tls_rpt_exists: bool = False              # _smtp._tls.<domain> TXT record present
+    tls_rpt_record: str = ""                  # Raw record (truncated to 200 chars)
+    tls_rpt_rua: str = ""                     # Reporting URI (mailto: or https:)
+
+    # === EMAIL: DANE / TLSA (RFC 7672) ===
+    dane_checked: bool = False                # True if we attempted DANE lookup
+    has_dane: bool = False                    # True if at least one MX has TLSA records
+    dane_mx_count: int = 0                    # Number of MX hosts with DANE configured
+    dane_total_mx: int = 0                    # Total MX hosts checked
+    dane_records_found: str = ""              # Semicolon-sep list of MX hosts with DANE
+
     # === BLACKLISTS ===
     domain_blacklists_hit: str = ""
     domain_blacklist_count: int = 0
@@ -2091,6 +2103,93 @@ def get_mta_sts(domain: str) -> Tuple[bool, str]:
         if 'v=sts' in record.lower():
             return True, record[:200]
     return False, ""
+
+
+def get_tls_rpt(domain: str) -> Tuple[bool, str, str]:
+    """
+    TLS Reporting (RFC 8460).
+
+    Looks up _smtp._tls.<domain> TXT for a record like:
+        v=TLSRPTv1; rua=mailto:tls-reports@example.com
+
+    Pairs with MTA-STS — when MTA-STS enforcement fails, the receiving MTA
+    sends an aggregate report to the rua= address. Without TLS-RPT configured,
+    the sender has no visibility into delivery failures from policy violations.
+
+    Returns: (exists, raw_record_truncated, rua_uri)
+    """
+    for record in dns_query(f"_smtp._tls.{domain}", 'TXT'):
+        record = record.strip('"').strip("'")
+        if 'v=tlsrptv1' in record.lower():
+            rua = ""
+            m = re.search(r'\brua=([^;\s]+)', record, re.IGNORECASE)
+            if m:
+                rua = m.group(1).strip()
+            return True, record[:200], rua
+    return False, "", ""
+
+
+def check_dane(mx_records: List[str]) -> Dict:
+    """
+    DANE / TLSA (RFC 7672).
+
+    For each MX host, query TLSA records at _25._tcp.<mx_host>. Presence of
+    TLSA records means the MX is using DNSSEC-anchored cert validation —
+    a strong signal of mature operational hygiene.
+
+    DANE is only meaningful when DNSSEC is enabled on the parent zone.
+    Callers should weight this signal alongside res.dnssec_enabled.
+
+    Returns dict:
+      checked       — True if we attempted lookups
+      has_dane      — True if any MX has TLSA records
+      mx_with_dane  — count of MX hosts with TLSA records
+      total_mx      — count of MX hosts checked
+      mx_hosts      — semicolon-sep list of MX hosts that have DANE
+    """
+    result = {
+        "checked": False,
+        "has_dane": False,
+        "mx_with_dane": 0,
+        "total_mx": 0,
+        "mx_hosts": [],
+    }
+
+    if not mx_records:
+        return result
+
+    result["checked"] = True
+
+    # Extract MX hostnames. Accept "priority:host", "priority host", or bare host.
+    mx_hosts = []
+    for entry in mx_records:
+        s = entry.strip()
+        if ":" in s:           # internal "priority:host" format
+            host = s.split(":", 1)[1].strip().rstrip('.')
+        elif " " in s:          # raw "priority host" DNS format
+            host = s.split()[-1].rstrip('.')
+        else:
+            host = s.rstrip('.')
+        if host:
+            mx_hosts.append(host)
+
+    result["total_mx"] = len(mx_hosts)
+
+    for mx_host in mx_hosts:
+        # TLSA records live at _25._tcp.<mx_host> for SMTP
+        tlsa_query = f"_25._tcp.{mx_host}"
+        try:
+            records = dns_query(tlsa_query, 'TLSA')
+            if records:
+                result["mx_with_dane"] += 1
+                result["mx_hosts"].append(mx_host)
+        except Exception:
+            # TLSA lookup failed — not all resolvers handle TLSA gracefully.
+            # Treat as "no DANE" rather than inconclusive.
+            pass
+
+    result["has_dane"] = result["mx_with_dane"] > 0
+    return result
 
 
 def check_blacklist(query: str, zone: str) -> Optional[bool]:
@@ -5603,9 +5702,24 @@ def generate_summary(res: DomainApprovalResult, signals: Set[str], rdap_enabled:
     
     if res.bimi_exists:
         positives.append("BIMI verified")
-    
+
     if res.mta_sts_exists:
         positives.append("MTA-STS enabled")
+
+    if res.tls_rpt_exists:
+        rua_part = f" → reports to {res.tls_rpt_rua}" if res.tls_rpt_rua else ""
+        positives.append(f"TLS-RPT configured{rua_part}")
+
+    if res.has_dane:
+        if res.dnssec_enabled:
+            positives.append(f"DANE/TLSA configured ({res.dane_mx_count}/{res.dane_total_mx} MX hosts)")
+        else:
+            # Orphan TLSA records without DNSSEC — record this but don't credit it
+            all_issues.append(
+                f"DANE TLSA WITHOUT DNSSEC → {res.dane_mx_count}/{res.dane_total_mx} MX have TLSA "
+                "records but DNSSEC is not enabled on the parent zone — receiving MTAs cannot "
+                "validate the chain of trust, so DANE has no security value here"
+            )
     
     # v7.5.1: Security tooling positive
     if res.content_security_signals:
@@ -6400,7 +6514,20 @@ def calculate_score(res: DomainApprovalResult, config: dict) -> None:
         add("has_bimi", weights.get('has_bimi', -8))
     if res.mta_sts_exists:
         add("has_mta_sts", weights.get('has_mta_sts', -5))
-    
+
+    # === TLS-RPT (TLS Reporting, RFC 8460) ===
+    # Pairs with MTA-STS — operators that configure both have visibility into
+    # delivery failures from policy violations. Strong operational maturity signal.
+    if res.tls_rpt_exists:
+        add("has_tls_rpt", weights.get('has_tls_rpt', -3))
+
+    # === DANE / TLSA (RFC 7672) ===
+    # DANE is only meaningful when DNSSEC is enabled (cert validation is anchored
+    # in the DNSSEC chain of trust). We require both to award the bonus to avoid
+    # crediting orphan TLSA records that no resolver can validate.
+    if res.has_dane and res.dnssec_enabled:
+        add("has_dane", weights.get('has_dane', -8))
+
     # === SECURITY TOOLING TRUST BONUS (v7.5.1) ===
     # Legitimate sites invest in bot management, CAPTCHA, and security tooling.
     # Phishing kits and spam operations almost never implement these (they cost
@@ -7806,6 +7933,7 @@ def analyze_domain(domain: str, timeout: float = 10.0, check_rdap: bool = True,
         r['mx_exists'], r['mx_records'], r['mx_is_null'] = get_mx(domain)
         r['bimi_exists'], r['bimi_record'] = get_bimi(domain)
         r['mta_sts_exists'], r['mta_sts_record'] = get_mta_sts(domain)
+        r['tls_rpt_exists'], r['tls_rpt_record'], r['tls_rpt_rua'] = get_tls_rpt(domain)
         return r
 
     def _task_domain_blacklists():
@@ -7921,6 +8049,23 @@ def analyze_domain(domain: str, timeout: float = 10.0, check_rdap: bool = True,
 
     res.bimi_exists, res.bimi_record = _ea['bimi_exists'], _ea['bimi_record']
     res.mta_sts_exists, res.mta_sts_record = _ea['mta_sts_exists'], _ea['mta_sts_record']
+    res.tls_rpt_exists = _ea['tls_rpt_exists']
+    res.tls_rpt_record = _ea['tls_rpt_record']
+    res.tls_rpt_rua = _ea['tls_rpt_rua']
+
+    # --- DANE / TLSA (RFC 7672) — only meaningful when MX records exist ---
+    if res.mx_records:
+        try:
+            _mx_list = res.mx_records.split(";") if res.mx_records else []
+            _dane = check_dane(_mx_list)
+            res.dane_checked = _dane["checked"]
+            res.has_dane = _dane["has_dane"]
+            res.dane_mx_count = _dane["mx_with_dane"]
+            res.dane_total_mx = _dane["total_mx"]
+            res.dane_records_found = ";".join(_dane["mx_hosts"][:5])
+        except Exception:
+            # DANE lookups can fail in restricted environments — silent fail.
+            pass
 
     # --- Apply domain blacklist results ---
     bl_hits, bl_count, bl_inconclusive = _f_dbl.result()
