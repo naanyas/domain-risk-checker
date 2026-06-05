@@ -54,7 +54,7 @@ try:
 except ImportError:
     WHOIS_AVAILABLE = False
 
-from config import DEFAULT_CONFIG, get_weight
+from config import DEFAULT_CONFIG, get_weight, DO_PROBE
 
 try:
     from app_store_detection import check_app_store_presence
@@ -79,6 +79,14 @@ try:
     CONTENT_CHECKS_AVAILABLE = True
 except Exception:
     CONTENT_CHECKS_AVAILABLE = False
+
+try:
+    # v8.3 Consumer-harm pipeline — pop/push/scareware/browlock/cloak.
+    # Lives alongside content_checks so it always runs after analyze_content().
+    from consumer_harm_checks import run as run_consumer_harm
+    CONSUMER_HARM_AVAILABLE = True
+except Exception:
+    CONSUMER_HARM_AVAILABLE = False
 
 try:
     from threat_intel import check_google_safebrowsing, check_urlhaus, check_phishtank, check_abuseipdb
@@ -459,6 +467,19 @@ class DomainApprovalResult:
     content_spa_framework_name: str = ""             # Framework name (e.g. "Next.js", "Angular")
     content_external_script_domains: str = ""        # Non-CDN external script domains (semicolon-sep)
     content_external_link_domains: str = ""          # All external domains linked via <a href> (semicolon-sep, with paths)
+
+    # === v8.3 CONSUMER HARM CHECKS ===
+    # Populated by consumer_harm_checks.run() after page HTML is fetched.
+    # consumer_score_contribution feeds into calculate_score() alongside
+    # the existing weights.  The notice is the consumer-panel string; the
+    # breakdown/evidence/combos are analyst-only audit data.
+    consumer_score_contribution: int = 0             # Points to add to total risk score
+    consumer_risk_level: str = ""                    # "none" | "caution" | "high" | "severe" ("" = not run)
+    consumer_notice: str = ""                        # Plain-English summary for consumer panel
+    consumer_internal_breakdown: str = ""            # JSON: signal -> points (analyst-only)
+    consumer_analyst_evidence: str = ""              # JSON: signal -> list[evidence] (analyst-only)
+    consumer_combo_hits: str = ""                    # Semicolon-joined combo names that fired
+    consumer_ad_push_hosts: str = ""                 # Hosts owned by consumer-harm (skipped by UNKNOWN_EXTERNAL_SCRIPT)
     contact_reuse_results: str = ""                   # JSON: contact info found on other domains (OSINT cross-reference)
     content_visible_word_count: int = -1             # Number of visible words on page (-1 = not checked)
     content_security_signals: str = ""               # v7.5.1: Security tooling detected (recaptcha, cloudflare_bot_management, etc.)
@@ -7541,7 +7562,18 @@ def calculate_score(res: DomainApprovalResult, config: dict) -> None:
         rules_hit.append(rule_name)
         if rule_label:
             rules_labels.append(rule_label)
-    
+
+    # === v8.3: Consumer-harm score contribution ===
+    # consumer_harm_checks.run() was invoked during analyze_domain (after the
+    # page content was fetched) and stashed its score on res.  Fold it into
+    # the running total here so the DENY threshold comparison sees it.
+    # Per-signal weights are already accounted for inside the consumer-harm
+    # module (it uses CONSUMER_-prefixed keys from the same weights dict),
+    # so we add the rolled-up contribution as one number to avoid recomputing.
+    if res.consumer_score_contribution:
+        score += res.consumer_score_contribution
+        breakdown["consumer_harm"] = res.consumer_score_contribution
+
     res.risk_score = max(0, min(score, 100))
     
     bands = [(0, 19, "LOW"), (20, 39, "MEDIUM"), (40, 64, "HIGH"), (65, 84, "CRITICAL"), (85, 999, "SEVERE")]
@@ -8812,7 +8844,37 @@ def analyze_domain(domain: str, timeout: float = 10.0, check_rdap: bool = True,
                 res.content_visible_word_count = cc.get("visible_word_count", -1)
             except Exception:
                 pass  # Non-critical — don't break analysis if content check fails
-        
+
+        # === CONSUMER HARM CHECKS (v8.3) ===
+        # Pop/push-ad networks, scareware, browlock, cloaking — runs after
+        # content_checks so we have res.content_is_facade for the facade
+        # gate.  Dynamic probe (DO_PROBE) makes 2 outbound requests, so it's
+        # gated by config and skipped on facade pages where the body is
+        # empty in source anyway.
+        if CONSUMER_HARM_AVAILABLE and content:
+            try:
+                _ch_html = content.decode('utf-8', errors='replace') if isinstance(content, bytes) else content
+                _ch_url  = res.final_url or f"http://{domain}"
+                _ch = run_consumer_harm(
+                    url=_ch_url,
+                    html=_ch_html,
+                    facade=res.content_is_facade,
+                    do_dynamic_probe=DO_PROBE,
+                )
+                res.consumer_score_contribution = int(_ch.get("score_contribution", 0))
+                res.consumer_risk_level = _ch.get("consumer_risk_level", "none")
+                res.consumer_notice    = _ch.get("consumer_notice", "")
+                res.consumer_internal_breakdown = json.dumps(_ch.get("internal_breakdown", {}))
+                res.consumer_analyst_evidence   = json.dumps(_ch.get("analyst_evidence", {}))
+                _combos = _ch.get("combo_hits", [])
+                if _combos:
+                    res.consumer_combo_hits = ";".join(_combos)
+                _hosts = _ch.get("ad_push_hosts_hit", set())
+                if _hosts:
+                    res.consumer_ad_push_hosts = ";".join(sorted(_hosts))
+            except Exception:
+                pass  # Non-critical — never block analysis on consumer-harm failure
+
         # === CONTACT CROSS-REFERENCE (OSINT) ===
         # Search web for emails/phones found on the page appearing on other domains.
         # Informational only — helps analysts spot coordinated campaigns.

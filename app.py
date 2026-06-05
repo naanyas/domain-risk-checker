@@ -598,7 +598,60 @@ def display_results(results: list):
         with col2:
             st.markdown("**Summary:**")
             st.info(domain_data['summary'])
-            
+
+            # === CONSUMER-FACING SAFETY PANEL (v8.3) ===
+            # Renders the plain-English notice from consumer_harm_checks.run().
+            # This is what a SENDER (or their compliance reviewer) sees — no
+            # signal names, no point counts, no evidence URLs.  Analyst-only
+            # detail (internal_breakdown, combo_hits, analyst_evidence) lives
+            # in the expander below; it is NOT in this panel.
+            _consumer_level = (domain_data.get('consumer_risk_level') or '').lower()
+            _consumer_notice = domain_data.get('consumer_notice') or ''
+            if _consumer_level and _consumer_level != 'none':
+                _renderer = {
+                    'caution': st.warning,
+                    'high':    st.warning,
+                    'severe':  st.error,
+                }.get(_consumer_level, st.info)
+                _label = {
+                    'caution': '⚠️ Consumer Safety — Caution',
+                    'high':    '🚫 Consumer Safety — High Risk',
+                    'severe':  '⛔ Consumer Safety — Severe',
+                }.get(_consumer_level, 'Consumer Safety')
+                _renderer(f"**{_label}**\n\n{_consumer_notice}")
+
+                # Analyst-only detail — hidden behind an expander so the
+                # consumer panel stays clean.  Keep internal_breakdown,
+                # combo_hits, and analyst_evidence INSIDE this expander only.
+                with st.expander("🔬 Analyst evidence (consumer-harm)"):
+                    _ch_breakdown_raw = domain_data.get('consumer_internal_breakdown') or '{}'
+                    _ch_evidence_raw  = domain_data.get('consumer_analyst_evidence') or '{}'
+                    _ch_combos_raw    = domain_data.get('consumer_combo_hits') or ''
+                    try:
+                        _ch_breakdown = json.loads(_ch_breakdown_raw)
+                    except (json.JSONDecodeError, TypeError):
+                        _ch_breakdown = {}
+                    try:
+                        _ch_evidence = json.loads(_ch_evidence_raw)
+                    except (json.JSONDecodeError, TypeError):
+                        _ch_evidence = {}
+                    if _ch_breakdown:
+                        st.markdown("**Internal breakdown**")
+                        for sig, pts in sorted(_ch_breakdown.items(),
+                                               key=lambda kv: kv[1], reverse=True):
+                            st.markdown(f"&nbsp;&nbsp;`{sig}` **+{pts}**")
+                    if _ch_combos_raw:
+                        st.markdown("**Combo hits**")
+                        for combo in _ch_combos_raw.split(';'):
+                            if combo.strip():
+                                st.markdown(f"&nbsp;&nbsp;🔗 {combo.strip()}")
+                    if _ch_evidence:
+                        st.markdown("**Evidence**")
+                        for category, items in _ch_evidence.items():
+                            st.markdown(f"&nbsp;&nbsp;**{category}:**")
+                            for item in (items or [])[:8]:
+                                st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;• {item}")
+
             # === SCORE BREAKDOWN ===
             breakdown_json = domain_data.get('score_breakdown', '')
             if breakdown_json:

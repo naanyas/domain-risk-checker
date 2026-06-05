@@ -1624,3 +1624,240 @@ def get_weight(config: dict, signal: str) -> int:
 def get_combo_weight(config: dict, signal1: str, signal2: str) -> int:
     """DEPRECATED: Combos are now unified rules. Returns 0."""
     return 0
+
+
+# ============================================================================
+# CONSUMER HARM MODULE — constants & weights (v8.3)
+# ============================================================================
+# Backs consumer_harm_checks.run().  Keeping all tunables here so this file
+# stays the single source of truth for scoring, taxonomies, and thresholds.
+#
+# Scoring keys live INSIDE DEFAULT_CONFIG["weights"] with a CONSUMER_ prefix
+# so they can be tuned from the admin UI without colliding with any existing
+# weight key.  The taxonomy + pattern lists live at module scope because
+# they're code-shaped data, not knobs an operator should be twisting at
+# runtime — change them via PR.
+# ============================================================================
+
+# ---- Dynamic probe gate ----------------------------------------------------
+# The cloaking probe inside consumer_harm_checks fires TWO outbound requests
+# (browser UA + crawler UA) and diffs the responses.  Turn OFF in
+# environments without network egress (CI, sandboxed analyzer) so the static
+# scan still runs.  Production analyzer leaves it on.
+DO_PROBE: bool = True
+
+
+# ---- Risk-band thresholds for consumer-facing label ------------------------
+# The score returned by consumer_harm_checks.run() is bucketed into a
+# user-facing level using these inclusive lower bounds.  Tune in tandem with
+# the per-signal weights below.
+CONSUMER_LEVELS: dict = {
+    "none":    0,   # 0–4    — nothing meaningful detected
+    "caution": 5,   # 5–14   — one mild signal (e.g. chumbox network)
+    "high":    15,  # 15–29  — single severe signal OR combo of mild ones
+    "severe":  30,  # 30+    — multi-signal pattern or active cloaking
+}
+
+
+# ---- Category caps ---------------------------------------------------------
+# Prevents one category from running away with the score on, e.g., a single
+# page that loads 12 ad-network scripts.  Each category contributes AT MOST
+# this many points before combo bonuses are layered on top.
+CONSUMER_CATEGORY_CAP: dict = {
+    "ads":       25,
+    "push":      25,
+    "chumbox":   10,
+    "scareware": 30,
+    "browlock":  30,
+    "cloak":     35,
+}
+
+
+# ---- Combo bonuses ---------------------------------------------------------
+# Two categories co-occurring tells you more than either one alone.  Cloak
+# is the multiplier — a site that ALSO cloaks is almost certainly doing
+# something it doesn't want a normal visitor (or a reviewer) to see.
+CONSUMER_COMBO_BONUS: dict = {
+    ("ads",       "cloak"): 10,
+    ("push",      "cloak"): 15,
+    ("scareware", "cloak"): 15,
+    ("browlock",  "cloak"): 15,
+    # Push prompt + scareware is the classic pop-up scam funnel.
+    ("push",      "scareware"): 10,
+}
+
+
+# ---- AD POP / POPUNDER networks --------------------------------------------
+# Hosts whose primary product is intrusive pop/popunder/interstitial ads.
+# Match is per-host (suffix or exact).  Some of these also run other ad
+# formats — that's fine; flagging the network is the signal we care about.
+#
+# Conservative list — better to under-flag than false-positive on legitimate
+# adtech (DoubleClick, AdSense, etc. are deliberately NOT here).
+CONSUMER_AD_POP_NETWORKS: set = {
+    "popads.net", "popcash.net", "popunder.net",
+    "propellerads.com",          # also push — but pop is dominant
+    "adcash.com",
+    "adsterra.com",              # multi-format, pop + push dominant on bad-host inventory
+    "hilltopads.com", "hilltopads.net",
+    "clickadu.com",
+    "exoclick.com", "exoclick.net",
+    "juicyads.com", "juicyads.net",
+    "ero-advertising.com",
+    "trafficstars.com",
+    "adnium.com",
+    "planetad.com",
+    "popmyads.com",
+    "popwin.net",
+    "adfly.com", "adf.ly",
+    "shorte.st",
+    "linkvertise.com",
+    "ouo.io",
+}
+
+
+# ---- PUSH-AD providers (notification spam) ---------------------------------
+# Push-notification ad networks.  Distinct from neutral push platforms below.
+# These networks specifically monetize notification spam: ads delivered AFTER
+# the user grants Notification permission, often to sites the user has long
+# since closed.
+CONSUMER_PUSH_AD_PROVIDERS: set = {
+    "richads.com",
+    "megapush.com", "megapu.sh",
+    "datspush.com",
+    "evadav.com",
+    "notixads.com", "notixads.net", "notix.io",
+    "adskeeper.com",
+    "pushmojo.com",
+    "pushroad.com",
+    "mobpush.io",
+    "pushhouse.com",
+    "adoperator.com",
+    "pushpushgo.com",
+    # propellerads + adsterra ALSO operate push networks; they're already in
+    # the pop list above and matched there.  No need to double-list — the
+    # analyzer treats them as ads.
+}
+
+
+# ---- NEUTRAL push platforms ------------------------------------------------
+# Legitimate push-as-a-service SDKs commonly used by real apps and brands.
+# Presence does NOT score.  Listed here so consumer_harm_checks can recognize
+# them and avoid scoring a Notification.requestPermission() call that's
+# wired to one of these as a "push-ad" signal.
+CONSUMER_PUSH_PLATFORMS_NEUTRAL: set = {
+    "onesignal.com",
+    "pushwoosh.com", "pushwoosh.io",
+    "airship.com", "urbanairship.com",
+    "pusher.com",
+    "ably.com", "ably.io",
+    "firebase.google.com",
+    "fcm.googleapis.com",
+    "gcm-http.googleapis.com",
+    "braze.com",
+    "iterable.com",
+    "batch.com",
+    "messaging.azure.com",
+    "leanplum.com",
+}
+
+
+# ---- NATIVE chumbox / content-recommendation networks ----------------------
+# Outbrain/Taboola-style "Around the Web" widgets.  Not necessarily malicious
+# — these run on plenty of legit news sites — but their inventory routinely
+# includes clickbait and weight-loss/crypto scams, so we score them as a mild
+# consumer-quality signal (5 pts uncapped, max 10 with category cap).
+CONSUMER_NATIVE_CHUMBOX: set = {
+    "taboola.com", "trc.taboola.com",
+    "outbrain.com", "widgets.outbrain.com",
+    "revcontent.com", "trends.revcontent.com",
+    "mgid.com", "servicer.mgid.com",
+    "content.ad",
+    "engageya.com",
+    "adnow.com",
+    "zergnet.com",
+    "nativeads.com",
+    "yengo.com",
+}
+
+
+# ---- SCAREWARE text patterns -----------------------------------------------
+# Regex fragments that appear in fake-virus and tech-support scam pages.
+# Matched (case-insensitive) against the page's VISIBLE text only — skipped
+# when facade=True since the body is empty on SPA shells.
+#
+# Order is roughly highest-confidence first.  Each match is a single signal;
+# multiple matches do NOT compound (the category cap handles that).
+CONSUMER_SCAREWARE_PATTERNS: list = [
+    r"your\s+(?:computer|pc|mac|iphone|ipad|android|device)\s+(?:is|has\s+been)\s+(?:infected|hacked|compromised|at\s+risk)",
+    r"critical\s+security\s+(?:warning|alert|notice)",
+    r"windows\s+defender\s+(?:security\s+)?alert",
+    r"microsoft\s+(?:security\s+)?(?:warning|alert)",
+    r"your\s+apple\s+id\s+(?:has\s+been\s+)?(?:locked|suspended|compromised)",
+    r"(?:trojan|spyware|malware|ransomware)\s+(?:detected|found|identified)",
+    r"call\s+(?:apple|microsoft|google)\s+support\s+(?:immediately|now)",
+    r"call\s+now\s+to\s+(?:remove|fix)\s+(?:virus|threat|malware)",
+    r"your\s+antivirus\s+(?:has\s+)?expired",
+    r"do\s+not\s+(?:close|turn\s+off)\s+(?:this\s+)?(?:window|computer)",
+    r"\(\d{3}\)\s*\d{3}-\d{4}.{0,40}(?:support|technician|engineer)",
+    r"your\s+device\s+(?:has\s+been\s+)?(?:blocked|locked)\s+for\s+security",
+]
+
+
+# ---- BROWLOCK JS patterns --------------------------------------------------
+# Code shapes that trap the browser tab: alert-loops, fullscreen-on-load,
+# beforeunload abuse, history-spoofing-back-button-defeat.  Matched against
+# raw HTML/JS source (NOT visible text) — runs even when facade=True since
+# the trap code itself sits in <script> tags.
+CONSUMER_BROWLOCK_PATTERNS: list = [
+    # alert-loops — for/while around alert()/confirm()
+    r"(?:for|while)\s*\([^)]{0,80}\)\s*\{[^}]{0,200}(?:alert|confirm)\s*\(",
+    # beforeunload trap (combined with returnValue or e.preventDefault())
+    r"(?:onbeforeunload|addEventListener\s*\(\s*['\"]beforeunload)[^;]{0,300}(?:returnValue|preventDefault)",
+    # fullscreen-on-load
+    r"(?:document\.documentElement|document\.body)\.requestFullscreen\s*\(",
+    # history.pushState loop (back-button defeat)
+    r"history\.pushState[^;]{0,80};\s*window\.onpopstate\s*=",
+    # Hard "you cannot leave" phrasing in JS strings
+    r"['\"](?:you\s+(?:are\s+not\s+)?(?:authorized\s+to\s+)?(?:leave|navigate\s+away)|press\s+f11)['\"]",
+    # Tab-pinning via window.opener
+    r"window\.opener\s*=\s*null\s*;\s*window\.open\s*\(",
+]
+
+
+# ---- CLOAKING patterns (static, looked at in source) -----------------------
+# Code shapes that branch behavior on crawler UA / referrer.  Strong signal
+# that the page intends a different experience for bots vs visitors.
+CONSUMER_CLOAK_PATTERNS: list = [
+    # Crawler UA conditional in script
+    r"(?:googlebot|bingbot|yandex|baidu|duckduckbot|applebot)[^)]{0,80}(?:test|indexOf|match|exec)",
+    r"navigator\.userAgent[^;]{0,200}(?:googlebot|bingbot|yandex|baidu)",
+    # Referrer-based redirect (Google → different page)
+    r"document\.referrer[^;]{0,80}(?:google|bing|yahoo|duckduckgo)[^;]{0,200}(?:location\.href|location\.replace|window\.location)",
+    # Geo / IP-based redirect template (rare in HTML but happens)
+    r"\b(?:if|switch)\s*\([^)]{0,80}country[_\s]?code[^)]{0,80}\)[^;]{0,200}(?:location\.href|location\.replace)",
+    # Meta-refresh ONLY for bot UA — usually injected via inline script
+    r"<meta\s+http-equiv=[\"']refresh[\"'][^>]{0,200}>\s*<script[^>]*>[^<]{0,200}(?:googlebot|crawler|bot)",
+    # crawler-conditional document.write
+    r"if\s*\([^)]{0,80}(?:crawler|spider|bot)[^)]{0,80}\)[^;]{0,200}document\.write",
+]
+
+
+# ---- Merge CONSUMER_* score weights into DEFAULT_CONFIG --------------------
+# Done as a post-definition merge so the canonical DEFAULT_CONFIG["weights"]
+# dict above stays untouched / git-blame-clean.  These are admin-tunable from
+# the same weight-editor UI used for all other signals.
+DEFAULT_CONFIG["weights"].update({
+    # Per-host hits — fire once per distinct host found on the page,
+    # uncapped count, then clamped by CONSUMER_CATEGORY_CAP.
+    "CONSUMER_AD_POP_HOST":   12,   # popads.net, propellerads.com, etc.
+    "CONSUMER_PUSH_AD_HOST":  10,   # richads.com, evadav.com, etc.
+    "CONSUMER_CHUMBOX_HOST":   5,   # taboola, outbrain, mgid — common on legit news, low weight
+    # Behavior signals (not host-based)
+    "CONSUMER_PUSH_PROMPT":     8,  # Notification.requestPermission() in source
+    "CONSUMER_SCAREWARE_TEXT": 20,  # any scareware phrase in visible body
+    "CONSUMER_BROWLOCK_PATTERN": 20,  # any browlock JS shape
+    # Cloak
+    "CONSUMER_CLOAK_STATIC":  12,   # cloak pattern in source
+    "CONSUMER_CLOAK_DYNAMIC": 25,   # confirmed crawler-UA returns different content
+})

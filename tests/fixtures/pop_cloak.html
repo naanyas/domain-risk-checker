@@ -1,0 +1,29 @@
+<!doctype html>
+<html>
+<head>
+  <title>Free streaming! Watch Now!</title>
+  <!-- Pop-ad network — should be scored under CONSUMER_AD_POP_HOST -->
+  <script src="https://propellerads.com/loader.js" async></script>
+  <!-- A second pop-ad host to corroborate -->
+  <script src="https://popads.net/serve.js" async></script>
+  <!-- Cloaking pattern: branch behavior on crawler UA -->
+  <script>
+    if (/googlebot|bingbot|yandex|baidu/i.test(navigator.userAgent)) {
+      document.write("<h1>About our site</h1><p>We provide clean content for search engines.</p>");
+    } else {
+      window.location.replace("https://aff-tracker.example/r?id=42");
+    }
+  </script>
+  <!-- Referrer-based cloak corroboration -->
+  <script>
+    if (document.referrer.indexOf("google") !== -1) {
+      window.location.href = "https://aff-tracker.example/from-google";
+    }
+  </script>
+</head>
+<body>
+  <h1>You won't believe this one weird trick</h1>
+  <p>Click below to claim your free prize. Limited time only!</p>
+  <a href="https://aff-tracker.example/cta">Claim now</a>
+</body>
+</html>

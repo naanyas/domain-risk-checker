@@ -49,6 +49,37 @@ import ssl
 from typing import Dict, List, Optional
 from urllib.parse import urlparse
 
+# v8.3: Consumer-harm host taxonomies — used to AVOID emitting
+# UNKNOWN_EXTERNAL_SCRIPT for hosts that the consumer-harm module already
+# scores in its ads/push categories.  Without this guard, an ad-network
+# script (e.g. propellerads.com) would get penalized twice (once here as
+# UNKNOWN_EXTERNAL_SCRIPT, once as CONSUMER_AD_POP_HOST).  Import is
+# optional so the scanner still works if consumer_harm hasn't been wired.
+try:
+    from config import CONSUMER_AD_POP_NETWORKS, CONSUMER_PUSH_AD_PROVIDERS
+    _CONSUMER_HOSTS_OWNED = set(CONSUMER_AD_POP_NETWORKS) | set(CONSUMER_PUSH_AD_PROVIDERS)
+except Exception:
+    _CONSUMER_HOSTS_OWNED = set()
+
+
+def _is_consumer_harm_host(host: str) -> bool:
+    """Suffix-match `host` against the AD/PUSH host taxonomies.
+
+    Same rule consumer_harm_checks._host_in_set() uses — keep them in sync.
+    Returns True when the host is already accounted for by the consumer-harm
+    module, so the caller should skip its own scoring of that host.
+    """
+    if not host or not _CONSUMER_HOSTS_OWNED:
+        return False
+    h = host.lower().strip(".")
+    for entry in _CONSUMER_HOSTS_OWNED:
+        e = entry.lower().strip(".")
+        if not e or "." not in e:
+            continue
+        if h == e or h.endswith("." + e):
+            return True
+    return False
+
 
 # ================================================================
 # Hacklink Keyword Families
@@ -187,6 +218,20 @@ CDN_WHITELIST = {
     # React / Vue / Angular CDN patterns
     "reactjs.org", "vuejs.org", "angular.io",
 }
+
+# v8.3: Safety assertion — the CDN whitelist MUST NOT include any host
+# that consumer_harm_checks treats as a paid ad-network or push-spam
+# provider.  If it does, that ad host gets a free pass through both
+# scoring modules and shows up nowhere in the risk total.  Neutral push
+# platforms (OneSignal, Pushwoosh, etc.) are deliberately allowed in
+# both lists — they're legitimate SDKs and aren't scored as ad signals.
+_AD_PUSH_BAD_OVERLAP = CDN_WHITELIST & _CONSUMER_HOSTS_OWNED
+assert not _AD_PUSH_BAD_OVERLAP, (
+    f"CDN_WHITELIST overlaps consumer-harm ad/push host taxonomies: "
+    f"{sorted(_AD_PUSH_BAD_OVERLAP)}. Remove these hosts from CDN_WHITELIST "
+    f"or remove them from CONSUMER_AD_POP_NETWORKS / "
+    f"CONSUMER_PUSH_AD_PROVIDERS in config.py."
+)
 
 # Patterns that are CRITICAL (weight=3) — near-certain SocGholish
 SOCGHOLISH_CRITICAL_PATTERNS = {
@@ -833,6 +878,14 @@ class HacklinkKeywordScanner:
 
             # Skip same-domain scripts (site's own JS bundles)
             if src_domain == page_domain or src_domain.endswith('.' + page_domain):
+                continue
+
+            # v8.3: Skip hosts already scored by consumer_harm_checks
+            # (CONSUMER_AD_POP_NETWORKS or CONSUMER_PUSH_AD_PROVIDERS).
+            # The consumer-harm module penalizes these as ad/push signals;
+            # double-counting them here as UNKNOWN_EXTERNAL_SCRIPT inflates
+            # the score for the same evidence.  Consumer-harm wins.
+            if _is_consumer_harm_host(src_domain):
                 continue
 
             # --- Signal: UNKNOWN_EXTERNAL_SCRIPT (+1) ---
