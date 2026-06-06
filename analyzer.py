@@ -6040,7 +6040,7 @@ def generate_summary(res: DomainApprovalResult, signals: Set[str], rdap_enabled:
             ('FREE HOSTING', weights.get('hosting_free', 10)),
             ('PARKING PAGE', weights.get('parking_page', 10)),
             ('CREDENTIAL FORM DETECTED', weights.get('credential_form', 10)),
-            ('E-COMMERCE WITHOUT', weights.get('ecommerce_no_identity', 15)),
+            ('E-COMMERCE WITHOUT', weights.get('ecommerce_no_identity', 50)),
             ('EMAIL TRACKING', weights.get('email_tracking_url', 10)),
             ('TLS HANDSHAKE FAILED', weights.get('tls_handshake_failed', 10)),
             ('TLS CONNECTION FAILED', weights.get('tls_connection_failed', 10)),
@@ -6933,7 +6933,7 @@ def calculate_score(res: DomainApprovalResult, config: dict) -> None:
     if res.has_cross_domain_brand_link:
         add("cross_domain_brand_link", weights.get('cross_domain_brand_link', 18))
     if res.is_ecommerce_site and res.missing_business_identity:
-        add("ecommerce_no_identity", weights.get('ecommerce_no_identity', 15))
+        add("ecommerce_no_identity", weights.get('ecommerce_no_identity', 50))
     
     # Web/TLS
     # Suppress no_https for domains with no A record — they can never have HTTPS,
