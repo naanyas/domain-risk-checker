@@ -7584,8 +7584,31 @@ def calculate_score(res: DomainApprovalResult, config: dict) -> None:
         score += res.consumer_score_contribution
         breakdown["consumer_harm"] = res.consumer_score_contribution
 
+    # === v8.4: URL-scope strips platform-level trust bonuses ===
+    # On the URL/path scope, domain-level reputation bonuses — BIMI, enterprise
+    # MX, app-store presence, MTA-STS / TLS-RPT / DANE, DNSWL listing, and the
+    # app-store/BIMI/MTA-STS combos — belong to the REGISTRABLE PLATFORM, not
+    # the specific tenant page.  Leaving them in lets a trusted host (e.g.
+    # payhip.com) launder a risky tenant page (/b/<id>): the platform's
+    # reputation cancels the page's own content risk.  Strip them here so this
+    # scope's verdict reflects the page itself.  Root scope is untouched, so the
+    # platform still gets full credit on its own row.  Handles both direct
+    # bonuses and rule-applied combos (rule keys are prefixed "rule:").
+    if res.scan_scope == "url":
+        _URL_SUPPRESSED_TRUST_BONUSES = {
+            "has_bimi", "mx_enterprise", "has_mta_sts", "has_tls_rpt", "has_dane",
+            "dnswl_listed_high", "dnswl_listed_medium", "dnswl_listed_low",
+            "app_store_high", "app_store_medium", "app_store_low",
+            "combo_appstore_hi_bimi", "combo_appstore_hi_mta_sts", "combo_appstore_med_bimi",
+        }
+        for _key in list(breakdown.keys()):
+            _base = _key[5:] if _key.startswith("rule:") else _key
+            if _base in _URL_SUPPRESSED_TRUST_BONUSES and breakdown[_key] < 0:
+                score -= breakdown[_key]      # remove a negative bonus → score rises
+                del breakdown[_key]
+
     res.risk_score = max(0, min(score, 100))
-    
+
     bands = [(0, 19, "LOW"), (20, 39, "MEDIUM"), (40, 64, "HIGH"), (65, 84, "CRITICAL"), (85, 999, "SEVERE")]
     res.risk_level = next((l for lo, hi, l in bands if lo <= res.risk_score <= hi), "UNKNOWN")
     
