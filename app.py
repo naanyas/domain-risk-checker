@@ -20,7 +20,7 @@ from dmarc_store import FileSystemDmarcStore
 from io import BytesIO
 
 # Import the analysis engine
-from analyzer import analyze_domain, DomainApprovalResult, calculate_score, ANALYZER_VERSION
+from analyzer import analyze_domain, DomainApprovalResult, calculate_score, ANALYZER_VERSION, get_registrable_domain
 from config import load_config, save_config, DEFAULT_CONFIG
 
 # Page config
@@ -76,70 +76,150 @@ def init_session_state():
 
 
 def parse_domains(text: str) -> list:
-    """Parse domain input text into list of domains."""
-    domains = []
+    """Parse input into submission descriptors (v8.4).
+
+    Each pasted entry is scored TWICE — once for the registrable root and once
+    for the exact submitted URL (path/subdomain) — so platform-as-tenant hosts
+    (payhip.com/b/<id>, *.gumroad.com, ...) get a verdict for the specific page,
+    not just the clean platform homepage.
+
+    Returns a list of dicts, one per entry (input order, duplicates kept), with:
+      root      registrable domain (mail-subdomain stripped) — drives root pass
+      url       full submitted URL with scheme — content target for URL pass
+      url_host  host of the submitted URL — domain arg for the URL pass
+      url_path  path of the submitted URL (no trailing slash) — for labeling
+      differs   True when a path or non-www subdomain is present
+    """
+    from urllib.parse import urlparse
+    # Mail subdomains are stripped for the ROOT derivation only — we still want
+    # to score the submitted host/path as-is on the URL pass.
+    _MAIL_PREFIXES = ("mail.", "mailing.", "webmail.", "smtp.", "imap.", "pop.", "mx.", "email.",
+                      "mailer.", "newsletter.", "news.", "notify.", "notifications.",
+                      "bounce.", "sender.", "send.", "em.", "mg.",  # Mailgun, SendGrid
+                      "return.", "reply.")
+    entries = []
     for line in text.replace(',', '\n').replace(';', '\n').splitlines():
-        d = line.strip().lower()
-        if not d or d.startswith('#'):
+        raw = line.strip()
+        if not raw or raw.startswith('#'):
             continue
-        # Clean URLs
-        if '://' in d:
-            from urllib.parse import urlparse
-            d = urlparse(d).netloc or urlparse(d).path
-        d = d.strip('/').strip('.')
-        # Strip common mail subdomains — we want to analyze the root domain
-        _MAIL_PREFIXES = ("mail.", "mailing.", "webmail.", "smtp.", "imap.", "pop.", "mx.", "email.",
-                          "mailer.", "newsletter.", "news.", "notify.", "notifications.",
-                          "bounce.", "sender.", "send.", "em.", "mg.",  # Mailgun, SendGrid
-                          "return.", "reply.")
+        # Parse from the ORIGINAL case — only the host is case-insensitive.
+        # Paths/queries are case-sensitive (e.g. payhip.com/b/h4LuB), so
+        # lowercasing them would fetch the wrong page.
+        has_scheme = '://' in raw
+        parsed = urlparse(raw) if has_scheme else urlparse('https://' + raw)
+        host = (parsed.netloc or '').strip('/').strip('.').lower()
+        path = parsed.path or ''
+        query = parsed.query or ''
+        scheme = parsed.scheme.lower() if has_scheme else 'https'
+        if not host or '.' not in host:
+            continue
+        # Registrable root (strip mail prefixes first, ROOT only).
+        root_host = host
         for pfx in _MAIL_PREFIXES:
-            if d.startswith(pfx):
-                d = d[len(pfx):]
+            if root_host.startswith(pfx):
+                root_host = root_host[len(pfx):]
                 break
-        if d and '.' in d:
-            domains.append(d)
-    return domains  # Return all entries in input order, including duplicates
+        root = get_registrable_domain(root_host)
+        clean_path = path.rstrip('/')
+        host_no_www = host[4:] if host.startswith('www.') else host
+        differs = bool(clean_path) or (host_no_www != root)
+        url = f"{scheme}://{host}{path}" + (f"?{query}" if query else "")
+        entries.append({
+            'raw': raw,
+            'root': root,
+            'url': url,
+            'url_host': host,
+            'url_path': clean_path,
+            'differs': differs,
+        })
+    return entries  # one descriptor per entry, input order, duplicates kept
 
 
-def run_analysis(domains: list, config: dict, progress_callback=None) -> list:
-    """Run domain analysis with current config. Processes domains in parallel."""
+def _scope_meta(result, scope: str, label: str, raw: str) -> None:
+    """Stamp scan_scope / display_label / submitted_input onto a result
+    (works for both DomainApprovalResult objects and the dict error fallback)."""
+    if isinstance(result, dict):
+        result['scan_scope'] = scope
+        result['display_label'] = label
+        result.setdefault('submitted_input', raw)
+    else:
+        result.scan_scope = scope
+        result.display_label = label
+        if not getattr(result, 'submitted_input', ''):
+            result.submitted_input = raw
+
+
+def _url_label(entry: dict) -> str:
+    """Unique, readable row key for an entry's URL-scope result."""
+    if entry['url_path']:
+        return f"{entry['url_host']}{entry['url_path']}"
+    if entry['url_host'] != entry['root']:
+        return entry['url_host']                      # non-www subdomain
+    return f"{entry['root']} (page)"                  # bare domain — disambiguate from root row
+
+
+def run_analysis(entries: list, config: dict, progress_callback=None) -> list:
+    """Run dual root + URL analysis for each entry. Results interleave as
+    [root_0, url_0, root_1, url_1, ...] to keep each pair adjacent."""
     max_workers = config.get('max_workers', 5)
-    results = [None] * len(domains)  # Pre-allocate to preserve input ordering
-    completed_count = [0]  # Mutable counter for closure access
+    results = [None] * (2 * len(entries))  # pre-allocate, preserve ordering
+    completed_count = [0]
     lock = threading.Lock()
 
-    def analyze_one(index, domain):
+    def analyze_one(slot, scope, domain, submitted_url, label, raw):
         try:
-            return index, analyze_domain(
+            r = analyze_domain(
                 domain=domain,
                 timeout=config.get('timeout', 10.0),
                 check_rdap=config.get('check_rdap', True),
                 weights=config.get('weights', {}),
                 threshold=config.get('approve_threshold', 50),
                 full_config=config,
+                submitted_url=submitted_url,
             )
         except Exception as e:
-            return index, {
+            r = {
                 'domain': domain,
                 'risk_score': 100,
                 'recommendation': 'DENY',
                 'summary': f'Analysis failed: {str(e)[:100]}',
                 'risk_level': 'ERROR',
             }
+        _scope_meta(r, scope, label, raw)
+        return slot, r
 
+    # Build the real work list: always a root pass; a URL pass only when the
+    # submitted URL differs from the root (path or non-www subdomain). Bare
+    # domains mirror the root result into the URL slot (no duplicate fetch).
+    mirror_slots = []   # (url_slot, root_slot, label, raw)
+    futures = {}
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(analyze_one, i, d): i
-            for i, d in enumerate(domains)
-        }
+        for i, e in enumerate(entries):
+            root_slot, url_slot = 2 * i, 2 * i + 1
+            futures[executor.submit(analyze_one, root_slot, 'root',
+                                    e['root'], None, e['root'], e['raw'])] = root_slot
+            if e['differs']:
+                futures[executor.submit(analyze_one, url_slot, 'url',
+                                        e['url_host'], e['url'], _url_label(e), e['raw'])] = url_slot
+            else:
+                mirror_slots.append((url_slot, root_slot, _url_label(e), e['raw']))
+
+        total_real = len(futures)
         for future in as_completed(futures):
-            idx, result = future.result()
-            results[idx] = result
+            slot, result = future.result()
+            results[slot] = result
             with lock:
                 completed_count[0] += 1
                 if progress_callback:
-                    progress_callback(completed_count[0] - 1, len(domains),
-                                      result.get('domain', '') if isinstance(result, dict) else '')
+                    label = result.get('display_label', '') if isinstance(result, dict) \
+                        else getattr(result, 'display_label', '')
+                    progress_callback(completed_count[0] - 1, total_real, label)
+
+    # Fill mirrored URL slots for bare domains by cloning the root result.
+    for url_slot, root_slot, label, raw in mirror_slots:
+        clone = copy.deepcopy(results[root_slot])
+        _scope_meta(clone, 'url', label, raw)
+        results[url_slot] = clone
 
     return results
 
@@ -151,14 +231,21 @@ def results_to_dataframe(results: list) -> pd.DataFrame:
     
     # Primary columns first
     primary_cols = ['domain', 'risk_score', 'recommendation', 'summary']
-    
-    # Convert to list of dicts if needed
-    if hasattr(results[0], '__dict__'):
-        data = [vars(r) for r in results]
-    else:
-        data = results
-    
+
+    # Convert each result to a dict (results may mix DomainApprovalResult
+    # objects and dict error-fallbacks, e.g. when one pass failed).
+    data = [vars(r) if hasattr(r, '__dict__') else dict(r) for r in results if r is not None]
+
     df = pd.DataFrame(data)
+
+    # v8.4: display_label is the unique UI row key (root vs URL pass). Fall back
+    # to the clean domain for any row that predates this field.
+    if 'display_label' not in df.columns:
+        df['display_label'] = df['domain']
+    else:
+        df['display_label'] = df['display_label'].fillna('').replace('', pd.NA).fillna(df['domain'])
+    if 'scan_scope' not in df.columns:
+        df['scan_scope'] = 'root'
     
     # Reorder columns
     cols = primary_cols + [c for c in df.columns if c not in primary_cols]
@@ -286,8 +373,11 @@ def display_results(results: list):
     tab1, tab2, tab3 = st.tabs(["📋 Summary View", "📊 Full Details", "⬇️ Download"])
     
     with tab1:
-        # Summary table with color coding — clean view: domain, score, result, threats, summary
-        summary_df = df[['domain', 'risk_score', 'recommendation', 'summary']].copy()
+        # Summary table with color coding — clean view: domain, scope, score, result, threats, summary
+        summary_df = df[['display_label', 'scan_scope', 'risk_score', 'recommendation', 'summary']].copy()
+        summary_df.rename(columns={'display_label': 'domain', 'scan_scope': 'scope'}, inplace=True)
+        summary_df['scope'] = summary_df['scope'].map(
+            {'root': '🌐 Root', 'url': '🔗 URL'}).fillna(summary_df['scope'])
         
         # v7.3.1: Build threat indicator column showing kit files and malicious links
         def _safe_str(val, default=''):
@@ -392,7 +482,8 @@ def display_results(results: list):
         
         # Build from full df (has all fields), then attach to summary_df
         threat_indicators = df.apply(_build_threat_indicator, axis=1)
-        summary_df.insert(3, 'threats', threat_indicators)
+        threat_indicators.index = summary_df.index
+        summary_df.insert(4, 'threats', threat_indicators)
         
         def color_recommendation(val):
             if val == 'APPROVE':
@@ -416,7 +507,8 @@ def display_results(results: list):
         
         # Column configuration for better display
         column_config = {
-            "domain": st.column_config.TextColumn("Domain", width="medium"),
+            "domain": st.column_config.TextColumn("Domain / URL", width="medium"),
+            "scope": st.column_config.TextColumn("Scope", width="small"),
             "risk_score": st.column_config.NumberColumn("Score", width="small"),
             "recommendation": st.column_config.TextColumn("Result", width="small"),
             "threats": st.column_config.TextColumn("Threats", width="medium"),
@@ -537,13 +629,16 @@ def display_results(results: list):
     st.markdown("---")
     st.subheader("🔍 Individual Domain Details")
     
-    selected_domain = st.selectbox(
-        "Select a domain to view details",
-        df['domain'].tolist()
+    _scope_emoji = {'root': '🌐', 'url': '🔗'}
+    selected_idx = st.selectbox(
+        "Select a domain/URL to view details",
+        df.index.tolist(),
+        format_func=lambda ix: f"{_scope_emoji.get(df.loc[ix, 'scan_scope'], '')} "
+                               f"{df.loc[ix, 'display_label']}".strip()
     )
-    
-    if selected_domain:
-        domain_data = df[df['domain'] == selected_domain].iloc[0]
+
+    if selected_idx is not None:
+        domain_data = df.loc[selected_idx]
         
         col1, col2 = st.columns([1, 2])
         
@@ -551,12 +646,21 @@ def display_results(results: list):
             # Score display
             score = domain_data['risk_score']
             rec = domain_data['recommendation']
-            
+
+            # v8.4: which scope this verdict is for (registrable root vs the
+            # exact submitted URL/subdomain), and the page actually scored.
+            _scope = domain_data.get('scan_scope', 'root')
+            if _scope == 'url':
+                _scored = domain_data.get('final_url') or domain_data.get('submitted_input') or ''
+                st.caption(f"🔗 **Submitted URL/subdomain** — scored page: `{_scored}`")
+            else:
+                st.caption(f"🌐 **Registrable root** — `{domain_data.get('domain', '')}`")
+
             if rec == 'APPROVE':
                 st.success(f"### ✅ {rec}")
             else:
                 st.error(f"### 🚫 {rec}")
-            
+
             st.metric("Risk Score", score)
             
             if 'risk_level' in domain_data:

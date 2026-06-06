@@ -106,7 +106,17 @@ class DomainApprovalResult:
     risk_score: int = 0
     recommendation: str = ""
     summary: str = ""
-    
+
+    # === SCAN SCOPE (v8.4: dual root / submitted-URL analysis) ===
+    # Each pasted entry yields TWO results: the registrable root and the exact
+    # submitted URL (path or subdomain).  scan_scope tags which one this is;
+    # display_label is the unique, human-readable row key the UI selects on
+    # (res.domain stays a clean hostname so TLD / WHOIS / DMARC logic keeps
+    # working).  submitted_input is the raw string the user pasted.
+    scan_scope: str = "root"          # "root" | "url"
+    display_label: str = ""           # UI row key, e.g. "payhip.com/b/h4LuB"
+    submitted_input: str = ""         # Raw URL/string the user pasted
+
     # === METADATA ===
     scan_timestamp: str = ""
     risk_level: str = ""
@@ -7965,7 +7975,7 @@ def calculate_score(res: DomainApprovalResult, config: dict) -> None:
 
 def analyze_domain(domain: str, timeout: float = 10.0, check_rdap: bool = True,
                    weights: dict = None, threshold: int = 50,
-                   full_config: dict = None) -> dict:
+                   full_config: dict = None, submitted_url: str = None) -> dict:
     """
     Main entry point for domain analysis.
     Returns dict with all results.
@@ -7992,6 +8002,11 @@ def analyze_domain(domain: str, timeout: float = 10.0, check_rdap: bool = True,
     }
     
     res = DomainApprovalResult(domain=domain)
+    if submitted_url:
+        # v8.4: URL-scope pass — DNS/WHOIS/TLS still key on `domain` (the host),
+        # but content is fetched from this exact submitted URL (path/subdomain).
+        res.submitted_input = submitted_url
+        res.scan_scope = "url"
     res.scan_timestamp = datetime.now(timezone.utc).isoformat()
     
     # DNS Resolution — with root domain fallback for subdomains
@@ -8443,17 +8458,32 @@ def analyze_domain(domain: str, timeout: float = 10.0, check_rdap: bool = True,
         res.cert_expired = tls["expired"]
         res.cert_wrong_host = tls["wrong_host"]
         
+        # v8.4: Content-fetch targets.  For the URL-scope pass we fetch the exact
+        # submitted page (path/subdomain) instead of the bare-domain homepage, so
+        # platform-as-tenant pages (payhip.com/b/<id>, *.gumroad.com, ...) get
+        # their own content scored.  Same-domain / DNS / WHOIS checks keep using
+        # `domain`.  `submitted_url` always carries a scheme (see app.parse_domains).
+        if submitted_url:
+            _pu = urlparse(submitted_url)
+            _fetch_host = _pu.netloc or domain
+            _fetch_pathq = _pu.path + (f"?{_pu.query}" if _pu.query else "")
+            _https_fetch = f"https://{_fetch_host}{_fetch_pathq}"
+            _http_fetch = f"http://{_fetch_host}{_fetch_pathq}"
+        else:
+            _https_fetch = f"https://{domain}"
+            _http_fetch = f"http://{domain}"
+
         # HTTP check
         if REQUESTS_AVAILABLE:
             try:
-                r = requests.head(f"http://{domain}", timeout=timeout, allow_redirects=False, verify=False)
+                r = requests.head(_http_fetch, timeout=timeout, allow_redirects=False, verify=False)
                 res.http_reachable = r.status_code in [200, 301, 302, 307, 308]
                 res.http_status = r.status_code
             except:
                 pass
-        
+
         # HTTPS with redirects + content
-        https_result = follow_redirects(f"https://{domain}", timeout, fetch_content=True)
+        https_result = follow_redirects(_https_fetch, timeout, fetch_content=True)
         res.https_reachable = https_result["ok"]
         res.https_status = https_result["initial_status"]
         res.redirect_count = https_result["hops"]
@@ -8483,7 +8513,7 @@ def analyze_domain(domain: str, timeout: float = 10.0, check_rdap: bool = True,
         # Content analysis
         content = https_result["content"]
         if not content and res.http_reachable:
-            http_result = follow_redirects(f"http://{domain}", timeout, fetch_content=True)
+            http_result = follow_redirects(_http_fetch, timeout, fetch_content=True)
             content = http_result["content"]
             res.content_length = http_result["content_length"]
         
