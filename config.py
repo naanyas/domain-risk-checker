@@ -1670,6 +1670,7 @@ CONSUMER_CATEGORY_CAP: dict = {
     "scareware": 30,
     "browlock":  30,
     "cloak":     35,
+    "mfa":       30,   # made-for-advertising / ad density (v8.4)
 }
 
 
@@ -1843,6 +1844,74 @@ CONSUMER_CLOAK_PATTERNS: list = [
 ]
 
 
+# ---- MADE-FOR-ADVERTISING / AD DENSITY (v8.4) -----------------------------
+# Mainstream display ad networks.  Unlike the pop/push lists above, presence
+# alone is NOT a harm — these are legitimate networks used by real publishers.
+# What flags a "made-for-advertising" (MFA) content farm is DENSITY: many ad
+# units crammed against thin/scraped content.  Used for evidence + as a sanity
+# corroborator alongside the unit-count markers below.
+CONSUMER_DISPLAY_AD_NETWORKS: set = {
+    "googlesyndication.com", "pagead2.googlesyndication.com",
+    "doubleclick.net", "securepubads.g.doubleclick.net", "g.doubleclick.net",
+    "adservice.google.com",
+    "ezoic.net", "ezoic.com", "ezojs.com", "ezoiccdn.com",
+    "mediavine.com", "scripts.mediavine.com",
+    "adthrive.com", "cafemedia.com",            # AdThrive / Raptive / CafeMedia
+    "media.net", "contextual.media.net",
+    "amazon-adsystem.com",
+    "monumetric.com", "themonetizr.com",
+    "snigelweb.com", "newor.media", "playwire.com",
+    "adpushup.com", "freestar.com", "publir.com", "raptive.com",
+}
+
+# Ad-unit count markers, grouped per network.  Markers WITHIN a group tend to
+# co-occur on the same ad unit (e.g. AdSense emits both an <ins> tag and a
+# data-ad-slot per unit), so the detector takes the MAX within a group and
+# SUMS across groups — avoids double-counting one slot as two.
+CONSUMER_MFA_UNIT_MARKER_GROUPS: list = [
+    [r"<ins\b[^>]*adsbygoogle", r"data-ad-slot\s*="],          # Google AdSense
+    [r"googletag\s*\.\s*defineSlot"],                          # Google Publisher Tag
+    [r"ezoic-pub-ad-placeholder", r"id=[\"']ezoic-pub-ad"],    # Ezoic
+    [r"class=[\"'][^\"']*\bmv[_-]\d", r"data-mv-"],            # Mediavine
+    [r"adthrive-ad", r"class=[\"'][^\"']*adthrive"],           # AdThrive / Raptive
+    [r"amzn_assoc_ad_type"],                                    # Amazon associates
+    [r"_mNHandle\b", r"data-medianet"],                         # Media.net
+]
+
+# Density tiers — (min_ad_units, max_words_per_ad, weight_key).  Evaluated in
+# order; FIRST match wins, so list strongest first.  "words_per_ad" = visible
+# words ÷ ad units; lower = denser = more made-for-advertising.
+CONSUMER_MFA_TIERS: list = [
+    (10, 120, "CONSUMER_MFA_EXTREME"),   # ad-stuffed content farm
+    (7,  200, "CONSUMER_MFA_HIGH"),
+    (4,  350, "CONSUMER_MFA_MODERATE"),
+    (3,  120, "CONSUMER_MFA_MODERATE"),  # few units but extremely dense
+]
+
+# AdSense Auto Ads (and Ezoic/Mediavine/AdThrive) DELEGATE ad placement to the
+# network's stuffing algorithm, which injects many ads at render time from very
+# few source markers — so a static unit count badly understates the real ad
+# load.  These markers signal "ad placement handed to the stuffing engine,"
+# which is itself a made-for-advertising tell.  Escalates the density tier.
+CONSUMER_MFA_AUTO_ADS_MARKERS: list = [
+    r"enable_page_level_ads",
+    r"page-level-ads",
+    r"data-ad-format\s*=\s*[\"']?auto",
+    r"data-anchor-status",
+    r"data-vignette",
+    r"data-auto-format",
+]
+
+# Substrings of networks that auto-inject ads (presence ⇒ delegated stuffing).
+CONSUMER_MFA_AUTO_INJECT_NETWORKS: tuple = (
+    "ezoic", "mediavine", "adthrive", "raptive", "cafemedia", "playwire",
+)
+
+# Minimum visible words required before density is judged — below this the
+# ratio is statistically meaningless (and JS-rendered pages have empty source).
+CONSUMER_MFA_MIN_WORDS: int = 40
+
+
 # ---- Merge CONSUMER_* score weights into DEFAULT_CONFIG --------------------
 # Done as a post-definition merge so the canonical DEFAULT_CONFIG["weights"]
 # dict above stays untouched / git-blame-clean.  These are admin-tunable from
@@ -1860,4 +1929,8 @@ DEFAULT_CONFIG["weights"].update({
     # Cloak
     "CONSUMER_CLOAK_STATIC":  12,   # cloak pattern in source
     "CONSUMER_CLOAK_DYNAMIC": 25,   # confirmed crawler-UA returns different content
+    # Made-for-advertising / ad density (tiered — see CONSUMER_MFA_TIERS)
+    "CONSUMER_MFA_MODERATE": 15,    # noticeably ad-heavy relative to content
+    "CONSUMER_MFA_HIGH":     25,    # ad-stuffed
+    "CONSUMER_MFA_EXTREME":  30,    # made-for-advertising content farm
 })

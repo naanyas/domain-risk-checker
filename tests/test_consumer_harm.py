@@ -97,10 +97,57 @@ def test_pop_network_plus_cloak_crosses_40() -> None:
     assert "popads.net" in result["ad_push_hosts_hit"]
 
 
+def test_mfa_adfarm_flags_made_for_advertising() -> None:
+    """Ad-stuffed content farm: AdSense + Auto Ads + thin content. Should fire
+    the 'mfa' category at the HIGH tier (auto-ads escalation)."""
+    html = _load("mfa_adfarm.html")
+    result = ch.run(
+        url="https://ketogenic.example/recipe/",
+        html=html,
+        facade=False,
+        do_dynamic_probe=False,
+    )
+    assert "mfa" in result["categories_hit"], (
+        f"Expected 'mfa' category, got {result['categories_hit']} "
+        f"(breakdown: {result['internal_breakdown']})"
+    )
+    assert result["score_contribution"] >= 25, (
+        f"Expected made-for-advertising page to score >= 25 (HIGH), got "
+        f"{result['score_contribution']}: {result['internal_breakdown']}"
+    )
+    assert result["consumer_risk_level"] in ("high", "severe")
+    assert "CONSUMER_MFA_HIGH" in result["internal_breakdown"] or \
+           "CONSUMER_MFA_EXTREME" in result["internal_breakdown"]
+
+
+def test_light_ads_page_does_not_flag_mfa() -> None:
+    """A normal article with ONE AdSense unit, no auto-ads, and substantial
+    content must NOT be flagged as made-for-advertising."""
+    body = " ".join(["word"] * 600)
+    html = (
+        '<html><head>'
+        '<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>'
+        '</head><body><article><p>' + body + '</p>'
+        '<ins class="adsbygoogle" data-ad-slot="1234567890"></ins>'
+        '<script>(adsbygoogle = window.adsbygoogle || []).push({});</script>'
+        '</article></body></html>'
+    )
+    result = ch.run(url="https://legit-blog.example/post/", html=html,
+                    facade=False, do_dynamic_probe=False)
+    assert "mfa" not in result["categories_hit"], (
+        f"Light-ads page should NOT be flagged mfa, got "
+        f"{result['categories_hit']} ({result['internal_breakdown']})"
+    )
+
+
 if __name__ == "__main__":
     # Allow running as a plain script when pytest isn't installed.
     test_benign_html_returns_no_signals()
     print("✓ test_benign_html_returns_no_signals")
     test_pop_network_plus_cloak_crosses_40()
     print("✓ test_pop_network_plus_cloak_crosses_40")
+    test_mfa_adfarm_flags_made_for_advertising()
+    print("✓ test_mfa_adfarm_flags_made_for_advertising")
+    test_light_ads_page_does_not_flag_mfa()
+    print("✓ test_light_ads_page_does_not_flag_mfa")
     print("\nAll consumer-harm smoke tests passed.")

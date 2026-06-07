@@ -75,6 +75,12 @@ from config import (
     CONSUMER_SCAREWARE_PATTERNS,
     CONSUMER_BROWLOCK_PATTERNS,
     CONSUMER_CLOAK_PATTERNS,
+    CONSUMER_DISPLAY_AD_NETWORKS,
+    CONSUMER_MFA_UNIT_MARKER_GROUPS,
+    CONSUMER_MFA_TIERS,
+    CONSUMER_MFA_AUTO_ADS_MARKERS,
+    CONSUMER_MFA_AUTO_INJECT_NETWORKS,
+    CONSUMER_MFA_MIN_WORDS,
 )
 
 # ----------------------------------------------------------------------------
@@ -100,6 +106,25 @@ _PUSH_PROMPT_RE = re.compile(
 # Strip HTML tags for "visible text" analysis (scareware patterns).  Cheap;
 # accurate enough for keyword-shape matching.
 _TAG_STRIP_RE = re.compile(r'<[^>]+>')
+
+# Ad-unit count markers, compiled per network group (see config).  Markers in
+# the same group co-occur per unit → take MAX within a group, SUM across groups.
+_MFA_MARKER_GROUPS_COMPILED = [
+    [re.compile(p, re.IGNORECASE) for p in group]
+    for group in CONSUMER_MFA_UNIT_MARKER_GROUPS
+]
+_MFA_AUTO_ADS_COMPILED = [re.compile(p, re.IGNORECASE) for p in CONSUMER_MFA_AUTO_ADS_MARKERS]
+
+# <script>/<style> block stripper — for an accurate VISIBLE word count
+# (tag-strip alone would count inline JS/CSS as "words").
+_SCRIPT_STYLE_RE = re.compile(r'<(script|style)\b[^>]*>.*?</\1>', re.IGNORECASE | re.DOTALL)
+
+
+def _visible_word_count(html: str) -> int:
+    """Approximate visible word count: drop <script>/<style>, strip tags."""
+    text = _SCRIPT_STYLE_RE.sub(" ", html)
+    text = _TAG_STRIP_RE.sub(" ", text)
+    return len(re.findall(r"[A-Za-z]{2,}", text))
 
 
 # ----------------------------------------------------------------------------
@@ -234,6 +259,84 @@ def _scan_chumbox(
     raw = per_host * len(matched)
     capped = min(raw, CONSUMER_CATEGORY_CAP["chumbox"])
     return capped, {"CONSUMER_CHUMBOX_HOST": capped}, sorted(matched), set(matched)
+
+
+def _scan_mfa(
+    hosts: Set[str],
+    html: str,
+    facade: bool,
+    weights: Dict[str, int],
+) -> Tuple[int, Dict[str, int], List[str]]:
+    """Made-for-advertising / ad-density detector.
+
+    Mainstream display ad networks (AdSense, GPT, Ezoic, Mediavine, AdThrive,
+    Media.net, Amazon) are legitimate — so presence alone is not scored.  What
+    we flag is DENSITY: many ad units crammed against thin content, the
+    signature of a made-for-advertising content farm.
+
+    Skipped on facade SPAs (empty source body → meaningless word ratio).
+    Returns (capped_score, breakdown, evidence).
+    """
+    if facade:
+        return 0, {}, []
+
+    # Count ad units: MAX within each network group, SUM across groups.
+    units = 0
+    per_network: List[str] = []
+    for group in _MFA_MARKER_GROUPS_COMPILED:
+        g = max((len(rx.findall(html)) for rx in group), default=0)
+        units += g
+
+    networks = sorted({h for h in hosts if _host_in_set(h, CONSUMER_DISPLAY_AD_NETWORKS)})
+
+    # Auto-ads / auto-injecting networks delegate placement to the stuffing
+    # engine — the static unit count understates the real ad load, so this
+    # escalates the tier regardless of how few explicit units are in source.
+    auto_ads = any(rx.search(html) for rx in _MFA_AUTO_ADS_COMPILED) or any(
+        k in n for n in networks for k in CONSUMER_MFA_AUTO_INJECT_NETWORKS
+    )
+
+    # Need a recognized display network, plus either real explicit units or an
+    # auto-ads setup — avoids flagging a site that merely uses an "ad"-ish class.
+    if not networks or (units < 3 and not auto_ads):
+        return 0, {}, []
+
+    words = _visible_word_count(html)
+    if words < CONSUMER_MFA_MIN_WORDS:
+        # Too little content to judge density reliably (or JS-rendered).
+        return 0, {}, []
+
+    words_per_ad = words / units if units else float("inf")
+
+    # Explicit-unit tier (first match wins; config lists strongest first).
+    chosen_key: Optional[str] = None
+    for min_units, max_wpa, key in CONSUMER_MFA_TIERS:
+        if units >= min_units and words_per_ad <= max_wpa:
+            chosen_key = key
+            break
+
+    # Auto-ads escalation, scaled by how thin the content is.  Take whichever
+    # tier scores higher (explicit-unit vs auto-ads).
+    if auto_ads:
+        auto_key = ("CONSUMER_MFA_EXTREME" if words <= 700
+                    else "CONSUMER_MFA_HIGH" if words <= 1400
+                    else "CONSUMER_MFA_MODERATE")
+        if chosen_key is None or _weight(weights, auto_key) > _weight(weights, chosen_key):
+            chosen_key = auto_key
+
+    if not chosen_key:
+        return 0, {}, []
+
+    pts = _weight(weights, chosen_key)
+    capped = min(pts, CONSUMER_CATEGORY_CAP["mfa"])
+    density = (f"~1 ad per {words_per_ad:.0f} words" if units
+              else "auto-ads (dynamic placement)")
+    evidence = [
+        f"{units} explicit ad units / ~{words} visible words ({density})"
+        + ("; AdSense/network AUTO-ADS enabled" if auto_ads else ""),
+        f"ad networks: {', '.join(networks[:6])}",
+    ]
+    return capped, {chosen_key: capped}, evidence
 
 
 def _scan_scareware(
@@ -406,6 +509,8 @@ def _build_notice(categories_hit: Set[str], level: str) -> str:
         pieces.append("tries to send you browser notifications that can continue after you leave")
     if "chumbox" in categories_hit:
         pieces.append("embeds third-party clickbait recommendation widgets")
+    if "mfa" in categories_hit:
+        pieces.append("is built mainly to display ads, packing many ad units around thin content (made-for-advertising)")
     if "scareware" in categories_hit:
         pieces.append("displays fake virus or security warnings designed to scare you into action")
     if "browlock" in categories_hit:
@@ -479,6 +584,14 @@ def run(
         breakdown.update(b)
         evidence["chumbox"] = ev
         categories_hit.add("chumbox")
+
+    # 4b. Made-for-advertising / ad density (skipped on facade SPAs)
+    s, b, ev = _scan_mfa(hosts, html, facade, weights)
+    if s:
+        total += s
+        breakdown.update(b)
+        evidence["mfa"] = ev
+        categories_hit.add("mfa")
 
     # 5. Scareware (skipped on facade SPAs — body is empty in source)
     s, b, ev = _scan_scareware(html, facade, weights)
