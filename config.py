@@ -1869,8 +1869,12 @@ CONSUMER_DISPLAY_AD_NETWORKS: set = {
 # data-ad-slot per unit), so the detector takes the MAX within a group and
 # SUMS across groups — avoids double-counting one slot as two.
 CONSUMER_MFA_UNIT_MARKER_GROUPS: list = [
-    [r"<ins\b[^>]*adsbygoogle", r"data-ad-slot\s*="],          # Google AdSense
-    [r"googletag\s*\.\s*defineSlot"],                          # Google Publisher Tag
+    # AdSense: <ins> / data-ad-slot in source, OR the rendered ad iframe
+    # (google_ads_iframe / aswift_) once a headless render has run.  MAX within
+    # the group avoids counting one slot as both a unit and an iframe.
+    [r"<ins\b[^>]*adsbygoogle", r"data-ad-slot\s*=",
+     r"google_ads_iframe", r"id=[\"']aswift_\d"],             # Google AdSense (source + rendered)
+    [r"googletag\s*\.\s*defineSlot", r"id=[\"']div-gpt-ad"],   # Google Publisher Tag
     [r"ezoic-pub-ad-placeholder", r"id=[\"']ezoic-pub-ad"],    # Ezoic
     [r"class=[\"'][^\"']*\bmv[_-]\d", r"data-mv-"],            # Mediavine
     [r"adthrive-ad", r"class=[\"'][^\"']*adthrive"],           # AdThrive / Raptive
@@ -1923,6 +1927,29 @@ CONSUMER_MFA_CLIENT_MARKERS: list = [
 # content ≈ made-for-advertising.  Long-form single-network AdSense is left
 # alone (legit blogs).  Only fires at MODERATE — needs a corroborator to DENY.
 CONSUMER_MFA_THIN_WORDS: int = 1100
+
+
+# ---- HEADLESS RENDER GATE (v8.5) -------------------------------------------
+# Headless rendering (Playwright/Chromium) executes client-side JS so ad units
+# and content injected at runtime become visible to the scanners.  It's slow
+# and heavy, so it's AUTO-GATED: a page is rendered only when the static fetch
+# hints that ads/content are client-injected.  Degrades to static when the
+# browser layer is unavailable (see headless_render.RENDER_AVAILABLE).
+DO_RENDER: bool = True             # master switch (False → always static)
+RENDER_TIMEOUT: float = 10.0       # per-page ceiling, seconds
+
+# Ad-network / publisher hints in static HTML that justify a render.
+RENDER_AD_HINTS: list = [
+    r"googlesyndication", r"doubleclick", r"adservice\.google",
+    r"ezoic", r"mediavine", r"adthrive", r"raptive", r"cafemedia",
+    r"media\.net", r"amazon-adsystem", r"data-ad-client", r"ca-pub-\d",
+    r"googletag", r"playwire", r"monumetric", r"freestar",
+]
+# WordPress markers — content farms are overwhelmingly WP.  Render WP pages
+# whose static content is short-form (typical farm) so client-injected ads
+# surface; long-form WP sites are left on the fast static path.
+RENDER_WP_MARKERS: list = [r"/wp-content/", r"/wp-includes/", r"wp-json", r"wp-embed"]
+RENDER_WP_THIN_WORDS: int = 1500
 
 # Minimum visible words required before density is judged — below this the
 # ratio is statistically meaningless (and JS-rendered pages have empty source).

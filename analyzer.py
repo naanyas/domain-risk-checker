@@ -54,7 +54,45 @@ try:
 except ImportError:
     WHOIS_AVAILABLE = False
 
-from config import DEFAULT_CONFIG, get_weight, DO_PROBE
+from config import (
+    DEFAULT_CONFIG, get_weight, DO_PROBE,
+    DO_RENDER, RENDER_TIMEOUT, RENDER_AD_HINTS, RENDER_WP_MARKERS, RENDER_WP_THIN_WORDS,
+)
+
+try:
+    # v8.5 headless render — executes client-side JS so runtime-injected ad
+    # units / content are visible to the content scans.  Guarded: if Playwright
+    # or its browser isn't installed, RENDER_AVAILABLE is False and we stay
+    # on the static fetch (the analyzer never breaks without the browser layer).
+    from headless_render import render_html, RENDER_AVAILABLE
+except Exception:
+    RENDER_AVAILABLE = False
+    def render_html(*_a, **_k):  # type: ignore
+        return None
+
+_RENDER_AD_HINTS_RE = re.compile("|".join(RENDER_AD_HINTS), re.IGNORECASE)
+_RENDER_WP_RE = re.compile("|".join(RENDER_WP_MARKERS), re.IGNORECASE)
+
+
+def _should_render(html_str: str) -> bool:
+    """Auto-gate (v8.5): is it worth paying for a headless render of this page?
+
+    True when the static HTML hints that ads/content are injected client-side:
+      • an ad-network / publisher loader is referenced, OR
+      • it's a WordPress page with short-form content (typical content farm).
+    Long-form, ad-free static pages stay on the fast static path.
+    """
+    if not html_str:
+        return False
+    if _RENDER_AD_HINTS_RE.search(html_str):
+        return True
+    if _RENDER_WP_RE.search(html_str):
+        # crude visible-word estimate (strip script/style/tags)
+        _t = re.sub(r"<(script|style)\b[^>]*>.*?</\1>", " ", html_str, flags=re.I | re.S)
+        _t = re.sub(r"<[^>]+>", " ", _t)
+        if len(re.findall(r"[A-Za-z]{2,}", _t)) < RENDER_WP_THIN_WORDS:
+            return True
+    return False
 
 try:
     from app_store_detection import check_app_store_presence
@@ -116,6 +154,7 @@ class DomainApprovalResult:
     scan_scope: str = "root"          # "root" | "url"
     display_label: str = ""           # UI row key, e.g. "payhip.com/b/h4LuB"
     submitted_input: str = ""         # Raw URL/string the user pasted
+    render_used: bool = False         # v8.5: content scans ran on headless-rendered HTML
 
     # === METADATA ===
     scan_timestamp: str = ""
@@ -8548,7 +8587,26 @@ def analyze_domain(domain: str, timeout: float = 10.0, check_rdap: bool = True,
             if not (res.is_access_restricted or res.has_5xx or res.has_503):
                 if not content or len(content.strip()) < 50:
                     res.is_empty_page = True
-        
+
+        # === HEADLESS RENDER (v8.5, auto-gated) ===
+        # When the static page hints that ads/content are injected client-side,
+        # re-fetch via a headless browser so the runtime DOM (rendered ad units,
+        # late content) is what the content / consumer-harm scans see.  Targets
+        # this scope's page URL (homepage for root, submitted URL for url scope).
+        # Fully graceful: any failure or a missing browser leaves the static
+        # content in place, so analysis never breaks.
+        if DO_RENDER and RENDER_AVAILABLE and content and not res.is_access_restricted:
+            try:
+                _static_str = content.decode("utf-8", errors="replace")
+                if _should_render(_static_str):
+                    _rendered = render_html(_https_fetch, timeout=RENDER_TIMEOUT)
+                    if _rendered and len(_rendered) > 200:
+                        content = _rendered.encode("utf-8")
+                        res.render_used = True
+                        res.content_length = len(content)
+            except Exception:
+                pass  # never let rendering break analysis
+
         if content:
             res.content_hash = hashlib.md5(content).hexdigest()[:12]
             ca = analyze_content(content, res.final_url, domain)
