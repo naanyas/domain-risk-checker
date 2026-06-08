@@ -384,6 +384,9 @@ def _render_domain_detail(domain_data):
         else:
             st.caption(f"🌐 **Registrable root** — `{domain_data.get('domain', '')}`")
 
+        if domain_data.get('render_used'):
+            st.caption("🖥️ Analyzed via **headless render** (client-side ads/content executed)")
+
         if rec == 'APPROVE':
             st.success(f"### ✅ {rec}")
         else:

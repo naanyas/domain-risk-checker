@@ -8598,14 +8598,23 @@ def analyze_domain(domain: str, timeout: float = 10.0, check_rdap: bool = True,
         if DO_RENDER and RENDER_AVAILABLE and content and not res.is_access_restricted:
             try:
                 _static_str = content.decode("utf-8", errors="replace")
-                if _should_render(_static_str):
+                _gate = _should_render(_static_str)
+                import sys as _sys
+                print(f"[render] gate scope={res.scan_scope} url={_https_fetch[:80]} "
+                      f"should_render={_gate} avail={RENDER_AVAILABLE}", file=_sys.stderr, flush=True)
+                if _gate:
                     _rendered = render_html(_https_fetch, timeout=RENDER_TIMEOUT)
                     if _rendered and len(_rendered) > 200:
                         content = _rendered.encode("utf-8")
                         res.render_used = True
                         res.content_length = len(content)
-            except Exception:
-                pass  # never let rendering break analysis
+                        print(f"[render] used scope={res.scan_scope} "
+                              f"static={len(_static_str)} rendered={len(_rendered)}",
+                              file=_sys.stderr, flush=True)
+            except Exception as _re_err:
+                import sys as _sys
+                print(f"[render] block error: {type(_re_err).__name__}: {_re_err}",
+                      file=_sys.stderr, flush=True)
 
         if content:
             res.content_hash = hashlib.md5(content).hexdigest()[:12]

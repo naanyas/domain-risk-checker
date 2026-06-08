@@ -27,14 +27,25 @@ Public API
 
 from __future__ import annotations
 
+import sys
 from typing import Optional
+
+
+def _log(msg: str) -> None:
+    """Lightweight stderr diagnostics (captured by Railway logs)."""
+    try:
+        print(f"[render] {msg}", file=sys.stderr, flush=True)
+    except Exception:
+        pass
+
 
 try:
     from playwright.sync_api import sync_playwright  # type: ignore
     RENDER_AVAILABLE = True
-except Exception:  # pragma: no cover - import guard
+except Exception as _e:  # pragma: no cover - import guard
     sync_playwright = None  # type: ignore[assignment]
     RENDER_AVAILABLE = False
+    _log(f"playwright import failed: {type(_e).__name__}: {_e}")
 
 
 _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -87,8 +98,10 @@ def render_html(
                 except Exception:
                     pass
                 html = page.content()
+                _log(f"ok url={url[:80]} len={len(html or '')}")
                 return html or None
             finally:
                 browser.close()
-    except Exception:
+    except Exception as e:
+        _log(f"failed url={url[:80]} {type(e).__name__}: {str(e)[:160]}")
         return None
