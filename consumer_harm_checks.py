@@ -80,6 +80,8 @@ from config import (
     CONSUMER_MFA_TIERS,
     CONSUMER_MFA_AUTO_ADS_MARKERS,
     CONSUMER_MFA_AUTO_INJECT_NETWORKS,
+    CONSUMER_MFA_CLIENT_MARKERS,
+    CONSUMER_MFA_THIN_WORDS,
     CONSUMER_MFA_MIN_WORDS,
 )
 
@@ -114,6 +116,7 @@ _MFA_MARKER_GROUPS_COMPILED = [
     for group in CONSUMER_MFA_UNIT_MARKER_GROUPS
 ]
 _MFA_AUTO_ADS_COMPILED = [re.compile(p, re.IGNORECASE) for p in CONSUMER_MFA_AUTO_ADS_MARKERS]
+_MFA_CLIENT_COMPILED = [re.compile(p, re.IGNORECASE) for p in CONSUMER_MFA_CLIENT_MARKERS]
 
 # <script>/<style> block stripper — for an accurate VISIBLE word count
 # (tag-strip alone would count inline JS/CSS as "words").
@@ -296,9 +299,13 @@ def _scan_mfa(
         k in n for n in networks for k in CONSUMER_MFA_AUTO_INJECT_NETWORKS
     )
 
-    # Need a recognized display network, plus either real explicit units or an
-    # auto-ads setup — avoids flagging a site that merely uses an "ad"-ish class.
-    if not networks or (units < 3 and not auto_ads):
+    # Active-publisher proof: ad LOADER + publisher id (data-ad-client / ca-pub).
+    # Survives server-side fetches where in-content units are injected client-side.
+    has_client = any(rx.search(html) for rx in _MFA_CLIENT_COMPILED)
+
+    # Need a recognized display network, plus SOME monetization evidence:
+    # explicit units, an auto-ads setup, or an active-publisher loader.
+    if not networks or (units < 3 and not auto_ads and not has_client):
         return 0, {}, []
 
     words = _visible_word_count(html)
@@ -324,17 +331,35 @@ def _scan_mfa(
         if chosen_key is None or _weight(weights, auto_key) > _weight(weights, chosen_key):
             chosen_key = auto_key
 
+    # Loader-only fallback (robustness): no rendered units/auto-ads visible in the
+    # server-side HTML, but an active publisher loader IS present.  Flag at
+    # MODERATE when ad networks are stacked (>=2 distinct) OR the content is
+    # short-form (typical content farm).  Long-form single-network AdSense is
+    # left alone to limit false positives on legit publishers.
+    if chosen_key is None and has_client:
+        if len(networks) >= 2 or words <= CONSUMER_MFA_THIN_WORDS:
+            chosen_key = "CONSUMER_MFA_MODERATE"
+
     if not chosen_key:
         return 0, {}, []
 
     pts = _weight(weights, chosen_key)
     capped = min(pts, CONSUMER_CATEGORY_CAP["mfa"])
-    density = (f"~1 ad per {words_per_ad:.0f} words" if units
-              else "auto-ads (dynamic placement)")
+    if units:
+        density = f"~1 ad per {words_per_ad:.0f} words"
+    elif has_client:
+        density = "active ad publisher; units injected client-side (not in source)"
+    else:
+        density = "auto-ads (dynamic placement)"
+    _flags = []
+    if auto_ads:
+        _flags.append("AUTO-ADS enabled")
+    if has_client and not units:
+        _flags.append("publisher loader present")
     evidence = [
         f"{units} explicit ad units / ~{words} visible words ({density})"
-        + ("; AdSense/network AUTO-ADS enabled" if auto_ads else ""),
-        f"ad networks: {', '.join(networks[:6])}",
+        + (f"; {', '.join(_flags)}" if _flags else ""),
+        f"ad networks ({len(networks)}): {', '.join(networks[:6])}",
     ]
     return capped, {chosen_key: capped}, evidence
 

@@ -140,6 +140,40 @@ def test_light_ads_page_does_not_flag_mfa() -> None:
     )
 
 
+def test_mfa_loader_only_stripped_page_still_flags() -> None:
+    """Robustness: a server-side fetch that returns only the AdSense LOADER +
+    publisher id (units injected client-side) on short-form content should
+    still flag MFA at MODERATE via the loader fallback."""
+    body = " ".join(["recipe"] * 900)
+    html = (
+        '<html><head>'
+        '<script async src="https://pagead2.googlesyndication.com/pagead/js/'
+        'adsbygoogle.js?client=ca-pub-1234567890123456"></script>'
+        '</head><body><article><h1>Keto Bread</h1><p>' + body + '</p></article></body></html>'
+    )
+    result = ch.run(url="https://farm.example/recipe/", html=html,
+                    facade=False, do_dynamic_probe=False)
+    assert "mfa" in result["categories_hit"], result["internal_breakdown"]
+    assert result["score_contribution"] >= 15
+    assert "CONSUMER_MFA_MODERATE" in result["internal_breakdown"]
+
+
+def test_mfa_legit_longform_single_network_not_flagged() -> None:
+    """Long-form, single-network AdSense (legit publisher) must NOT be flagged
+    by the loader fallback — limits false positives."""
+    body = " ".join(["content"] * 2200)
+    html = (
+        '<html><head>'
+        '<script async src="https://pagead2.googlesyndication.com/pagead/js/'
+        'adsbygoogle.js?client=ca-pub-9"></script></head>'
+        '<body><article><p>' + body + '</p>'
+        '<ins class="adsbygoogle" data-ad-slot="1"></ins></article></body></html>'
+    )
+    result = ch.run(url="https://legit-blog.example/post/", html=html,
+                    facade=False, do_dynamic_probe=False)
+    assert "mfa" not in result["categories_hit"], result["internal_breakdown"]
+
+
 if __name__ == "__main__":
     # Allow running as a plain script when pytest isn't installed.
     test_benign_html_returns_no_signals()
@@ -150,4 +184,8 @@ if __name__ == "__main__":
     print("✓ test_mfa_adfarm_flags_made_for_advertising")
     test_light_ads_page_does_not_flag_mfa()
     print("✓ test_light_ads_page_does_not_flag_mfa")
+    test_mfa_loader_only_stripped_page_still_flags()
+    print("✓ test_mfa_loader_only_stripped_page_still_flags")
+    test_mfa_legit_longform_single_network_not_flagged()
+    print("✓ test_mfa_legit_longform_single_network_not_flagged")
     print("\nAll consumer-harm smoke tests passed.")

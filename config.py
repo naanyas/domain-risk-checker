@@ -1907,6 +1907,23 @@ CONSUMER_MFA_AUTO_INJECT_NETWORKS: tuple = (
     "ezoic", "mediavine", "adthrive", "raptive", "cafemedia", "playwire",
 )
 
+# Publisher-id markers — proof the page is an ACTIVE ad publisher (not just
+# referencing an ad domain).  Crucial for robustness: when a page is fetched
+# server-side (datacenter IP), ad-heavy sites often return the ad LOADER +
+# publisher id in <head> but inject the in-content ad units client-side, so
+# explicit-unit counting under-sees them.  The loader-only fallback (below)
+# uses this to still flag obvious monetized content farms.
+CONSUMER_MFA_CLIENT_MARKERS: list = [
+    r"data-ad-client",
+    r"client=ca-pub-\d",
+    r"ca-pub-\d{6,}",
+    r"googletag\.pubads",
+]
+# Word ceiling for the loader-only fallback: an active publisher + short-form
+# content ≈ made-for-advertising.  Long-form single-network AdSense is left
+# alone (legit blogs).  Only fires at MODERATE — needs a corroborator to DENY.
+CONSUMER_MFA_THIN_WORDS: int = 1100
+
 # Minimum visible words required before density is judged — below this the
 # ratio is statistically meaningless (and JS-rendered pages have empty source).
 CONSUMER_MFA_MIN_WORDS: int = 40
