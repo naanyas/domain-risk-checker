@@ -155,6 +155,7 @@ class DomainApprovalResult:
     display_label: str = ""           # UI row key, e.g. "payhip.com/b/h4LuB"
     submitted_input: str = ""         # Raw URL/string the user pasted
     render_used: bool = False         # v8.5: content scans ran on headless-rendered HTML
+    via_shortener: str = ""           # v8.6: short link this destination was resolved from (e.g. "a.co")
 
     # === METADATA ===
     scan_timestamp: str = ""
@@ -7623,6 +7624,17 @@ def calculate_score(res: DomainApprovalResult, config: dict) -> None:
         score += res.consumer_score_contribution
         breakdown["consumer_harm"] = res.consumer_score_contribution
 
+    # === v8.6: URL-shortener obfuscation flag ===
+    # The submission came via a short link that hid this destination.  Modest
+    # flag (the destination is scored on its own merits above); surfaces that
+    # the link concealed where it goes.
+    if res.via_shortener:
+        _short_pts = weights.get("url_shortener_redirect",
+                                 DEFAULT_CONFIG["weights"].get("url_shortener_redirect", 10))
+        if _short_pts:
+            score += _short_pts
+            breakdown["url_shortener_redirect"] = _short_pts
+
     # === v8.4: URL-scope strips platform-level trust bonuses ===
     # On the URL/path scope, domain-level reputation bonuses — BIMI, enterprise
     # MX, app-store presence, MTA-STS / TLS-RPT / DANE, DNSWL listing, and the
@@ -8037,7 +8049,8 @@ def calculate_score(res: DomainApprovalResult, config: dict) -> None:
 
 def analyze_domain(domain: str, timeout: float = 10.0, check_rdap: bool = True,
                    weights: dict = None, threshold: int = 50,
-                   full_config: dict = None, submitted_url: str = None) -> dict:
+                   full_config: dict = None, submitted_url: str = None,
+                   via_shortener: str = None) -> dict:
     """
     Main entry point for domain analysis.
     Returns dict with all results.
@@ -8069,6 +8082,11 @@ def analyze_domain(domain: str, timeout: float = 10.0, check_rdap: bool = True,
         # but content is fetched from this exact submitted URL (path/subdomain).
         res.submitted_input = submitted_url
         res.scan_scope = "url"
+    if via_shortener:
+        # v8.6: this destination was resolved from a URL shortener — the link
+        # hid where it actually goes.  Recorded for display + a modest flag in
+        # calculate_score; the destination itself is scored on its own merits.
+        res.via_shortener = via_shortener
     res.scan_timestamp = datetime.now(timezone.utc).isoformat()
     
     # DNS Resolution — with root domain fallback for subdomains

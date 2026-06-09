@@ -21,7 +21,7 @@ from io import BytesIO
 
 # Import the analysis engine
 from analyzer import analyze_domain, DomainApprovalResult, calculate_score, ANALYZER_VERSION, get_registrable_domain
-from config import load_config, save_config, DEFAULT_CONFIG
+from config import load_config, save_config, DEFAULT_CONFIG, URL_SHORTENERS
 
 # Page config
 st.set_page_config(
@@ -152,21 +152,90 @@ def _scope_meta(result, scope: str, label: str, raw: str) -> None:
 def _url_label(entry: dict) -> str:
     """Unique, readable row key for an entry's URL-scope result."""
     if entry['url_path']:
-        return f"{entry['url_host']}{entry['url_path']}"
-    if entry['url_host'] != entry['root']:
-        return entry['url_host']                      # non-www subdomain
-    return f"{entry['root']} (page)"                  # bare domain — disambiguate from root row
+        base = f"{entry['url_host']}{entry['url_path']}"
+    elif entry['url_host'] != entry['root']:
+        base = entry['url_host']                       # non-www subdomain
+    else:
+        base = f"{entry['root']} (page)"               # bare domain — disambiguate from root row
+    if entry.get('shortener_host'):
+        base = f"{base} (via {entry['shortener_host']})"
+    return base
+
+
+def _host_is_shortener(host: str) -> bool:
+    """True if host is a known URL shortener (exact or suffix match)."""
+    h = (host or "").lower().strip(".")
+    for s in URL_SHORTENERS:
+        s = s.lower().strip(".")
+        if h == s or h.endswith("." + s):
+            return True
+    return False
+
+
+def _resolve_final_url(url: str, timeout: float = 10.0):
+    """Follow redirects and return the final destination URL (or None)."""
+    try:
+        import requests
+        from urllib.parse import urlparse
+        ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
+        r = requests.get(url, headers={"User-Agent": ua}, timeout=timeout,
+                         allow_redirects=True, stream=True)
+        final = r.url
+        try:
+            r.close()
+        except Exception:
+            pass
+        if final and urlparse(final).netloc:
+            return final
+    except Exception:
+        pass
+    return None
+
+
+def _expand_shorteners(entries: list, config: dict) -> list:
+    """v8.6: for entries submitted via a URL shortener, resolve the real
+    destination and RE-TARGET the descriptor to it, so the analysis scores
+    where the link actually goes (root + path) instead of the redirector.
+    Records `via_shortener` (the original short link) for display + flagging.
+    Resolution failures leave the entry untouched (analyze the shortener)."""
+    from urllib.parse import urlparse
+    timeout = config.get("timeout", 10.0)
+    for e in entries:
+        if not _host_is_shortener(e.get("url_host", "")):
+            continue
+        final = _resolve_final_url(e["url"], timeout)
+        if not final:
+            continue
+        p = urlparse(final)
+        dest_host = (p.netloc or "").lower().strip(".")
+        if not dest_host or "." not in dest_host:
+            continue
+        # Only re-target if it actually left the shortener's domain.
+        if _host_is_shortener(dest_host) or dest_host == e["url_host"]:
+            continue
+        dest_path = (p.path or "").rstrip("/")
+        e["via_shortener"] = e["url"]            # original short link (for display/flag)
+        e["shortener_host"] = e["url_host"]
+        e["root"] = get_registrable_domain(dest_host)
+        e["url"] = final
+        e["url_host"] = dest_host
+        e["url_path"] = dest_path
+        e["differs"] = bool(dest_path) or (
+            (dest_host[4:] if dest_host.startswith("www.") else dest_host) != e["root"]
+        )
+    return entries
 
 
 def run_analysis(entries: list, config: dict, progress_callback=None) -> list:
     """Run dual root + URL analysis for each entry. Results interleave as
     [root_0, url_0, root_1, url_1, ...] to keep each pair adjacent."""
+    entries = _expand_shorteners(entries, config)
     max_workers = config.get('max_workers', 5)
     results = [None] * (2 * len(entries))  # pre-allocate, preserve ordering
     completed_count = [0]
     lock = threading.Lock()
 
-    def analyze_one(slot, scope, domain, submitted_url, label, raw):
+    def analyze_one(slot, scope, domain, submitted_url, label, raw, via_shortener=None):
         try:
             r = analyze_domain(
                 domain=domain,
@@ -176,6 +245,7 @@ def run_analysis(entries: list, config: dict, progress_callback=None) -> list:
                 threshold=config.get('approve_threshold', 50),
                 full_config=config,
                 submitted_url=submitted_url,
+                via_shortener=via_shortener,
             )
         except Exception as e:
             r = {
@@ -196,11 +266,12 @@ def run_analysis(entries: list, config: dict, progress_callback=None) -> list:
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         for i, e in enumerate(entries):
             root_slot, url_slot = 2 * i, 2 * i + 1
+            _via = e.get('via_shortener')
             futures[executor.submit(analyze_one, root_slot, 'root',
-                                    e['root'], None, e['root'], e['raw'])] = root_slot
+                                    e['root'], None, e['root'], e['raw'], _via)] = root_slot
             if e['differs']:
                 futures[executor.submit(analyze_one, url_slot, 'url',
-                                        e['url_host'], e['url'], _url_label(e), e['raw'])] = url_slot
+                                        e['url_host'], e['url'], _url_label(e), e['raw'], _via)] = url_slot
             else:
                 mirror_slots.append((url_slot, root_slot, _url_label(e), e['raw']))
 
@@ -386,6 +457,11 @@ def _render_domain_detail(domain_data):
 
         if domain_data.get('render_used'):
             st.caption("🖥️ Analyzed via **headless render** (client-side ads/content executed)")
+
+        if domain_data.get('via_shortener'):
+            st.warning(f"🔗 **Shortened link resolved** — submitted as `{domain_data.get('via_shortener')}` "
+                       f"(a URL shortener that hid the destination). Analyzing the real destination "
+                       f"`{domain_data.get('domain', '')}` below.")
 
         if rec == 'APPROVE':
             st.success(f"### ✅ {rec}")

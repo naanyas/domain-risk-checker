@@ -81,6 +81,44 @@ def test_compound_tld_root():
     assert e["url_path"] == "/product/123"
 
 
+def test_shortener_host_detection():
+    assert app._host_is_shortener("a.co") is True
+    assert app._host_is_shortener("bit.ly") is True
+    assert app._host_is_shortener("amazon.com") is False
+    assert app._host_is_shortener("notashortener.example") is False
+
+
+def test_expand_shorteners_retargets_to_destination():
+    """With resolution mocked, a shortener entry is re-pointed at the
+    destination (root + path) and tagged with via_shortener."""
+    orig = app._resolve_final_url
+    app._resolve_final_url = lambda url, timeout=10.0: "https://www.amazon.com/dp/B0H4D6B7GH?ref=x"
+    try:
+        entries = app.parse_domains("https://a.co/d/06eJm1RH")
+        out = app._expand_shorteners(entries, {"timeout": 5.0})[0]
+    finally:
+        app._resolve_final_url = orig
+    assert out["root"] == "amazon.com", out
+    assert out["url_host"] == "www.amazon.com"
+    assert out["url_path"] == "/dp/B0H4D6B7GH"
+    assert out["shortener_host"] == "a.co"
+    assert out["via_shortener"] == "https://a.co/d/06eJm1RH"
+    assert "(via a.co)" in app._url_label(out)
+
+
+def test_expand_shorteners_noop_on_resolve_failure():
+    """If resolution fails, the entry is left as the shortener (graceful)."""
+    orig = app._resolve_final_url
+    app._resolve_final_url = lambda url, timeout=10.0: None
+    try:
+        entries = app.parse_domains("https://a.co/d/06eJm1RH")
+        out = app._expand_shorteners(entries, {"timeout": 5.0})[0]
+    finally:
+        app._resolve_final_url = orig
+    assert out["root"] == "a.co"
+    assert "shortener_host" not in out
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

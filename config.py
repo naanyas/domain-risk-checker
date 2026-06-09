@@ -1929,6 +1929,22 @@ CONSUMER_MFA_CLIENT_MARKERS: list = [
 CONSUMER_MFA_THIN_WORDS: int = 1100
 
 
+# ---- URL SHORTENERS / LINK REDIRECTORS (v8.6) ------------------------------
+# Hosts whose whole purpose is to hide the real destination behind a short
+# link.  When a submission's host is one of these, the analyzer RESOLVES the
+# final destination and analyzes THAT (root + path) instead of the redirector —
+# otherwise it would just rate the trusted shortener ("a.co = Amazon = safe")
+# and never look at where the link actually goes.  Match is per-host (exact or
+# suffix).  amzn.to / a.co are Amazon's; the rest are general-purpose.
+URL_SHORTENERS: set = {
+    "a.co", "amzn.to", "amzn.com",
+    "bit.ly", "tinyurl.com", "t.co", "ow.ly", "rebrand.ly", "rb.gy",
+    "goo.gl", "is.gd", "buff.ly", "cutt.ly", "shorturl.at", "tiny.cc",
+    "lnkd.in", "trib.al", "dlvr.it", "snip.ly", "soo.gd", "s.id",
+    "linktr.ee", "lnk.to", "fb.me", "youtu.be", "g.co", "shorte.st",
+}
+
+
 # ---- HEADLESS RENDER GATE (v8.5) -------------------------------------------
 # Headless rendering (Playwright/Chromium) executes client-side JS so ad units
 # and content injected at runtime become visible to the scanners.  It's slow
@@ -1977,4 +1993,6 @@ DEFAULT_CONFIG["weights"].update({
     "CONSUMER_MFA_MODERATE": 15,    # noticeably ad-heavy relative to content
     "CONSUMER_MFA_HIGH":     25,    # ad-stuffed
     "CONSUMER_MFA_EXTREME":  30,    # made-for-advertising content farm
+    # Link obfuscation: submitted via a URL shortener that hid the destination
+    "url_shortener_redirect": 10,   # v8.6 — modest flag; destination is analyzed on its own merits
 })
