@@ -270,8 +270,13 @@ def run_analysis(entries: list, config: dict, progress_callback=None) -> list:
             futures[executor.submit(analyze_one, root_slot, 'root',
                                     e['root'], None, e['root'], e['raw'], _via)] = root_slot
             if e['differs']:
+                # URL pass: key infra (DNS/WHOIS/NS/typosquat/threat-intel) on the
+                # REGISTRABLE ROOT, not the subdomain host — a subdomain like
+                # www.amazon.com has no NS of its own and isn't a typosquat of the
+                # brand it belongs to. Content is still fetched from the full URL
+                # (submitted_url), so the specific page is what gets content-scored.
                 futures[executor.submit(analyze_one, url_slot, 'url',
-                                        e['url_host'], e['url'], _url_label(e), e['raw'], _via)] = url_slot
+                                        e['root'], e['url'], _url_label(e), e['raw'], _via)] = url_slot
             else:
                 mirror_slots.append((url_slot, root_slot, _url_label(e), e['raw']))
 
