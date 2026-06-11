@@ -4679,8 +4679,9 @@ def check_corporate_trust_signals(domain: str, timeout: float = 3.0) -> Dict:
         "pages_found": [],
         "missing_trust_signals": False,
         "trust_score": 0,  # Higher = more trustworthy
+        "trust_probe_blocked": False,  # v8.6.2: WAF blocked the probe (inconclusive)
     }
-    
+
     if not REQUESTS_AVAILABLE:
         return result
     
@@ -4701,6 +4702,7 @@ def check_corporate_trust_signals(domain: str, timeout: float = 3.0) -> Dict:
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         })
         
+        blocked = 0  # 401/403/429/503 — WAF/bot block, NOT "page absent"
         for page in TRUST_PAGES[:8]:  # Check up to 8 pages to limit requests
             result["pages_checked"].append(page)
             try:
@@ -4715,17 +4717,27 @@ def check_corporate_trust_signals(domain: str, timeout: float = 3.0) -> Dict:
                             continue
                     result["pages_found"].append(page)
                     result["trust_score"] += 1
+                elif r.status_code in (401, 403, 429, 503):
+                    blocked += 1
             except:
+                blocked += 1   # timeout/reset on a probe is usually a WAF too
                 continue
-        
+
         session.close()
     except:
         pass
-    
-    # Missing trust signals if we found 0-1 trust pages out of what we checked
-    if len(result["pages_found"]) <= 1 and len(result["pages_checked"]) >= 4:
+
+    # v8.6.2: only conclude "missing trust signals" when pages are genuinely
+    # ABSENT (404s) — NOT when a WAF blocked our datacenter probe. Big corporate
+    # sites (Cloudflare/Akamai) 403 these HEAD requests, which previously read
+    # as "no corporate footprint" for exactly the most-established companies.
+    checked = len(result["pages_checked"])
+    found = len(result["pages_found"])
+    if blocked >= max(2, checked // 2):
+        result["trust_probe_blocked"] = True
+    elif found <= 1 and checked >= 4:
         result["missing_trust_signals"] = True
-    
+
     return result
 
 
@@ -7026,6 +7038,18 @@ def calculate_score(res: DomainApprovalResult, config: dict) -> None:
     # Don't flag on empty pages — obviously an empty page has no /about etc.
     # Don't flag when TLS failed — can't find /about if the server is unreachable;
     # that's already covered by no_https / tls_connection_failed.
+    # v8.6.2: don't flag clearly-established corporate entities — a 5+yr domain
+    # with BIMI / enterprise MX / verified apps obviously HAS a footprint; the
+    # /about probe just got blocked by a WAF. Clearing the flag also drops the
+    # "NO CORPORATE FOOTPRINT" summary line and the facade combo rule.
+    _established_footprint = (
+        (res.domain_age_days is not None and res.domain_age_days >= 1825)  # 5+ years
+        or res.bimi_exists
+        or res.mx_provider_type == "enterprise"
+        or (res.app_store_has_presence and res.app_store_confidence in ("high", "medium"))
+    )
+    if res.missing_trust_signals and _established_footprint:
+        res.missing_trust_signals = False
     if res.missing_trust_signals and not res.is_empty_page and not res.tls_connection_failed and not res.tls_handshake_failed:
         add("missing_trust_signals", weights.get('missing_trust_signals', 8))
     
