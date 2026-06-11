@@ -47,6 +47,10 @@ except Exception as _e:  # pragma: no cover - import guard
     RENDER_AVAILABLE = False
     _log(f"playwright import failed: {type(_e).__name__}: {_e}")
 
+# Set True after the first failed browser launch (e.g. browser not installed) so
+# subsequent calls short-circuit instead of repeatedly paying a slow failure.
+_BROWSER_DISABLED = False
+
 
 _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
@@ -65,15 +69,24 @@ def render_html(
     ceiling in seconds; `settle_ms` is an extra wait after load for late ad
     injection.
     """
-    if not RENDER_AVAILABLE or not url:
+    global _BROWSER_DISABLED
+    if not RENDER_AVAILABLE or _BROWSER_DISABLED or not url:
         return None
     timeout_ms = int(max(1.0, timeout) * 1000)
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
-            )
+            try:
+                browser = p.chromium.launch(
+                    headless=True,
+                    args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+                )
+            except Exception as e:
+                # No usable browser (e.g. Streamlit Cloud: playwright pkg present
+                # but no Chromium installed). Disable for the rest of the process
+                # so we don't pay a failed launch on every gated page.
+                _BROWSER_DISABLED = True
+                _log(f"browser launch failed — disabling render: {type(e).__name__}: {str(e)[:120]}")
+                return None
             try:
                 context = browser.new_context(
                     user_agent=_UA,
