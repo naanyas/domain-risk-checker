@@ -119,6 +119,33 @@ def test_expand_shorteners_noop_on_resolve_failure():
     assert "shortener_host" not in out
 
 
+def test_wrapper_detection():
+    assert app._is_wrapper("l.facebook.com", "/l.php") is True
+    assert app._is_wrapper("google.com", "/url") is True
+    assert app._is_wrapper("www.google.com", "/url") is True
+    assert app._is_wrapper("google.com", "/search") is False   # only /url is a wrapper
+    assert app._is_wrapper("amazon.com", "/dp/X") is False
+
+
+def test_extract_wrapped_url_facebook_and_google():
+    fb = ("https://l.facebook.com/l.php?u=https%3A%2F%2Fketogenic.cookingpoint.net"
+          "%2Fgluten-free-bread%2F%3Ffbclid%3Dxyz&h=AT0")
+    assert app._extract_wrapped_url(fb) == "https://ketogenic.cookingpoint.net/gluten-free-bread/?fbclid=xyz"
+    g = "https://www.google.com/url?q=https://example.com/page&sa=D"
+    assert app._extract_wrapped_url(g) == "https://example.com/page"
+
+
+def test_expand_wrapper_retargets_via_param():
+    """Facebook l.php wrapper unwraps to its destination with NO network call."""
+    fb = ("https://l.facebook.com/l.php?u=https%3A%2F%2Fketogenic.cookingpoint.net"
+          "%2Fgluten-free-bread%2F&h=AT0")
+    out = app._expand_shorteners(app.parse_domains(fb), {"timeout": 5})[0]
+    assert out["root"] == "cookingpoint.net"
+    assert out["url_host"] == "ketogenic.cookingpoint.net"
+    assert out["shortener_host"] == "l.facebook.com"
+    assert "(via l.facebook.com)" in app._url_label(out)
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

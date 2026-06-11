@@ -1944,6 +1944,29 @@ URL_SHORTENERS: set = {
     "linktr.ee", "lnk.to", "fb.me", "youtu.be", "g.co", "shorte.st",
 }
 
+# ---- LINK WRAPPERS (v8.6.1) ------------------------------------------------
+# Social/search "safe link" shims that hide the real destination behind a
+# trusted host — same blind spot as shorteners (l.facebook.com = Meta = safe,
+# but the wrapped URL goes anywhere).  Unlike shorteners, these usually embed
+# the destination in a QUERY PARAM (?u= / ?q= / ?url=), so the resolver decodes
+# that param directly (more reliable than an HTTP redirect that may be gated).
+#
+# Whole-host wrappers (every URL on the host is a redirect shim):
+URL_WRAPPER_HOSTS: set = {
+    "l.facebook.com", "lm.facebook.com", "l.instagram.com", "l.messenger.com",
+    "l.wl.co", "out.reddit.com", "click.redditmail.com", "away.vk.com",
+    "t.umblr.com", "href.li", "exit.sc", "leaving.bandcamp.com",
+}
+# Path-scoped wrappers: the host is legit, only this path is a redirector —
+# (host_suffix, path_prefix).  Avoids treating ALL of google.com as a wrapper.
+URL_WRAPPER_PATHS: list = [
+    ("google.com", "/url"),
+    ("youtube.com", "/redirect"),
+    ("vk.com", "/away.php"),
+]
+# Query params that carry the wrapped destination, tried in this order.
+URL_WRAPPER_PARAMS: list = ["u", "q", "url", "target", "to", "z", "dest", "redirect", "r", "link"]
+
 
 # ---- HEADLESS RENDER GATE (v8.5) -------------------------------------------
 # Headless rendering (Playwright/Chromium) executes client-side JS so ad units

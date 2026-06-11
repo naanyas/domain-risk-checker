@@ -21,7 +21,10 @@ from io import BytesIO
 
 # Import the analysis engine
 from analyzer import analyze_domain, DomainApprovalResult, calculate_score, ANALYZER_VERSION, get_registrable_domain
-from config import load_config, save_config, DEFAULT_CONFIG, URL_SHORTENERS
+from config import (
+    load_config, save_config, DEFAULT_CONFIG,
+    URL_SHORTENERS, URL_WRAPPER_HOSTS, URL_WRAPPER_PATHS, URL_WRAPPER_PARAMS,
+)
 
 # Page config
 st.set_page_config(
@@ -162,14 +165,60 @@ def _url_label(entry: dict) -> str:
     return base
 
 
-def _host_is_shortener(host: str) -> bool:
-    """True if host is a known URL shortener (exact or suffix match)."""
+def _host_in(host: str, host_set) -> bool:
     h = (host or "").lower().strip(".")
-    for s in URL_SHORTENERS:
+    for s in host_set:
         s = s.lower().strip(".")
         if h == s or h.endswith("." + s):
             return True
     return False
+
+
+def _host_is_shortener(host: str) -> bool:
+    """True if host is a known URL shortener (exact or suffix match)."""
+    return _host_in(host, URL_SHORTENERS)
+
+
+def _is_wrapper(host: str, path: str) -> bool:
+    """True if (host[,path]) is a link-wrapper that hides the destination in a
+    query param — whole-host (l.facebook.com) or path-scoped (google.com/url)."""
+    if _host_in(host, URL_WRAPPER_HOSTS):
+        return True
+    h = (host or "").lower().strip(".")
+    p = path or ""
+    for host_suffix, path_prefix in URL_WRAPPER_PATHS:
+        hs = host_suffix.lower().strip(".")
+        if (h == hs or h.endswith("." + hs)) and p.startswith(path_prefix):
+            return True
+    return False
+
+
+def _is_redirector(host: str, path: str) -> bool:
+    """Shortener OR link-wrapper — anything that hides its real destination."""
+    return _host_is_shortener(host) or _is_wrapper(host, path)
+
+
+def _extract_wrapped_url(url: str):
+    """Pull the wrapped destination out of a link-wrapper's query param
+    (?u=/?q=/?url=...). Returns an absolute http(s) URL or None."""
+    try:
+        from urllib.parse import urlparse, parse_qs, unquote
+        q = parse_qs(urlparse(url).query)
+        for key in URL_WRAPPER_PARAMS:
+            vals = q.get(key)
+            if not vals:
+                continue
+            cand = unquote(vals[0]).strip()
+            if not cand:
+                continue
+            if "://" not in cand:
+                cand = "https://" + cand
+            cp = urlparse(cand)
+            if cp.scheme in ("http", "https") and cp.netloc and "." in cp.netloc:
+                return cand
+    except Exception:
+        pass
+    return None
 
 
 def _resolve_final_url(url: str, timeout: float = 10.0):
@@ -201,21 +250,27 @@ def _expand_shorteners(entries: list, config: dict) -> list:
     from urllib.parse import urlparse
     timeout = config.get("timeout", 10.0)
     for e in entries:
-        if not _host_is_shortener(e.get("url_host", "")):
+        host, path = e.get("url_host", ""), e.get("url_path", "")
+        is_wrap = _is_wrapper(host, path)
+        if not (_host_is_shortener(host) or is_wrap):
             continue
-        final = _resolve_final_url(e["url"], timeout)
+        # Wrappers embed the destination in a query param — decode it directly
+        # (more reliable). Fall back to following redirects for shorteners.
+        final = _extract_wrapped_url(e["url"]) if is_wrap else None
+        if not final:
+            final = _resolve_final_url(e["url"], timeout)
         if not final:
             continue
         p = urlparse(final)
         dest_host = (p.netloc or "").lower().strip(".")
         if not dest_host or "." not in dest_host:
             continue
-        # Only re-target if it actually left the shortener's domain.
-        if _host_is_shortener(dest_host) or dest_host == e["url_host"]:
+        # Only re-target if it actually left the redirector (not still a wrapper/shortener).
+        if _is_redirector(dest_host, p.path or "") or dest_host == host:
             continue
         dest_path = (p.path or "").rstrip("/")
         e["via_shortener"] = e["url"]            # original short link (for display/flag)
-        e["shortener_host"] = e["url_host"]
+        e["shortener_host"] = host
         e["root"] = get_registrable_domain(dest_host)
         e["url"] = final
         e["url_host"] = dest_host
